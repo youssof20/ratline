@@ -7,10 +7,15 @@ const state = {
   activeLabel: null,
   peers: [],
   rooms: [],
-  path: "-",
+  path: "",
   wipeDeadline: 0,
   codeTimer: null,
   lastCode: null,
+  pendingCode: null,
+  myShort: "",
+  myId: "",
+  lastSys: "",
+  lastSysAt: 0,
   index: [],
   demoRunning: false,
 };
@@ -21,18 +26,49 @@ function short(hex) {
   return (hex || "").slice(0, 8);
 }
 
+function humanError(err) {
+  const s = String(err);
+  if (/your own code|ourself/i.test(s)) {
+    return "that's your own code - give it to someone else";
+  }
+  if (/No addressing information|pkarr|TXT record|dns/i.test(s)) {
+    return "could not find host - code expired, wrong, or they are offline";
+  }
+  const line = s.split("\n")[0].trim();
+  if (/^dial pairing host/i.test(line)) {
+    return "could not reach host (code invalid or expired?)";
+  }
+  if (line.length > 120) {
+    return line.slice(0, 117) + "...";
+  }
+  return line;
+}
+
+function setCodeTtl(text, cls) {
+  const el = $("code-ttl");
+  el.textContent = text || "";
+  el.className = "code-ttl" + (cls ? " " + cls : "");
+}
+
+function clearCodeTimer() {
+  clearInterval(state.codeTimer);
+  state.codeTimer = null;
+  state.lastCode = null;
+  setCodeTtl("");
+}
+
 function setPath(path) {
-  state.path = (path || "-").toUpperCase();
+  state.path = path || "";
   $("path-label").textContent = state.path;
 }
 
 function updateStatusBar() {
   if (!state.active) {
     $("status-conv").textContent = "-";
-    setPath("-");
+    setPath("");
     return;
   }
-  const tag = state.activeKind === "room" ? "room" : "peer";
+  const tag = state.activeKind === "room" ? "group" : "dm";
   const name = state.activeLabel || short(state.active);
   $("status-conv").textContent = `${tag}:${name}`;
 }
@@ -43,14 +79,13 @@ function roomMemberCount() {
   return (r?.members || []).length;
 }
 
-/** True when more than two people are in the active room. */
 function isGroupRoom() {
-  // members[] is everyone else; +1 for self
   return state.activeKind === "room" && roomMemberCount() + 1 > 2;
 }
 
 function peerLabel(senderId) {
   if (!senderId) return short(state.active) || "peer";
+  if (state.myId && senderId === state.myId) return "me";
   const p = state.peers.find((x) => x.endpoint_id === senderId);
   if (p?.label) return p.label;
   const r = state.rooms.find((x) => x.topic_id === state.active);
@@ -59,22 +94,32 @@ function peerLabel(senderId) {
   return short(senderId);
 }
 
+function clearScreen() {
+  $("log").innerHTML = "";
+  $("typing").textContent = "";
+}
+
 function clearIdle() {
   const idle = $("log").querySelector(".idle-mark");
   if (idle) idle.remove();
 }
 
 function sys(text, cls) {
+  const t = String(text);
+  const now = Date.now();
+  if (t === state.lastSys && now - state.lastSysAt < 2500) return;
+  state.lastSys = t;
+  state.lastSysAt = now;
+
   const log = $("log");
   clearIdle();
   const line = document.createElement("div");
-  line.className = `line sys ${cls || ""}`;
-  line.textContent = text;
+  line.className = `line sys ${cls || ""}`.trim();
+  line.textContent = t;
   log.appendChild(line);
   log.scrollTop = log.scrollHeight;
 }
 
-/** System line with a copyable value in bold. */
 function sysValue(prefix, value, suffix) {
   const log = $("log");
   clearIdle();
@@ -114,7 +159,7 @@ function appendMsg(body, cls, _unused, meta) {
         });
         sys(`saved ${m[1]}`);
       } catch (e) {
-        sys(String(e));
+        sys(humanError(e));
       }
     };
   }
@@ -144,7 +189,11 @@ function showIdle() {
 
 async function refreshLists() {
   const status = await invoke("get_status");
-  $("short-id").textContent = status.short_id;
+  state.myId = status.endpoint_id || "";
+  state.myShort = status.short_id || "";
+  $("short-id").textContent = state.myShort || "····";
+  state.pendingCode = status.pairing_code || null;
+
   state.peers = await invoke("list_peers");
   state.rooms = await invoke("list_rooms");
 
@@ -152,7 +201,7 @@ async function refreshLists() {
     const p = state.peers.find((x) => x.endpoint_id === state.active);
     if (p) {
       state.activeLabel = p.label || short(p.endpoint_id);
-      setPath(p.connected ? p.path : "OFFLINE");
+      setPath(p.connected ? (p.path || "").toUpperCase() : "OFFLINE");
     }
   } else if (state.active && state.activeKind === "room") {
     const r = state.rooms.find((x) => x.topic_id === state.active);
@@ -163,57 +212,70 @@ async function refreshLists() {
   }
   updateStatusBar();
 
-  // code countdown into log (update last code line via dedicated tracker)
   if (status.pairing_code && status.pairing_expires_in != null) {
-    trackCodeExpiry(status.pairing_code, status.pairing_kind, status.pairing_expires_in);
+    trackCodeExpiry(
+      status.pairing_code,
+      status.pairing_kind,
+      status.pairing_expires_in
+    );
+  } else if (!status.pairing_code) {
+    clearCodeTimer();
   }
   return status;
 }
 
 function trackCodeExpiry(code, kind, secs) {
+  if (kind === "room") {
+    setCodeTtl("ROOM CODE");
+    return;
+  }
   if (state.lastCode === code && state.codeTimer) return;
   state.lastCode = code;
   clearInterval(state.codeTimer);
-  let left = secs;
-  const kindLabel = kind === "room" ? "room" : "peer";
-  sysValue(`${kindLabel} code  `, code);
-  if (kind === "room") {
-    sys("reusable while this room is open");
-    return;
-  }
-  const tick = () => {
+
+  let left = Math.max(0, Math.floor(secs));
+  const updateTtl = () => {
     if (left <= 0) {
-      clearInterval(state.codeTimer);
-      state.codeTimer = null;
+      clearCodeTimer();
       sys("code expired");
       return;
     }
-    // only spam every 30s or when urgent
-    if (left === secs || left % 30 === 0 || left <= 60) {
-      const cls = left <= 60 ? "ttl-critical" : left <= 180 ? "ttl-urgent" : "";
-      sys(`expires in ${left}s`, cls);
-    }
+    let cls = "";
+    if (left <= 60) cls = "critical";
+    else if (left <= 180) cls = "warn";
+    const m = Math.floor(left / 60);
+    const s = left % 60;
+    const label =
+      m > 0 ? `CODE ${m}:${String(s).padStart(2, "0")}` : `CODE ${left}s`;
+    setCodeTtl(label, cls);
     left -= 1;
   };
-  tick();
-  state.codeTimer = setInterval(tick, 1000);
+  updateTtl();
+  state.codeTimer = setInterval(updateTtl, 1000);
 }
 
-async function openConv(id, kind, label, path) {
+async function openConv(id, kind, label, path, opts = {}) {
+  const force = opts.force === true;
+  if (!force && state.active === id) return;
+
   state.active = id;
   state.activeKind = kind;
   state.activeLabel = label || short(id);
-  setPath(path || "-");
+  setPath(path || "");
   updateStatusBar();
-  sys(`${kind} ${state.activeLabel}`);
+  clearScreen();
+  const convWord = kind === "room" ? "group" : "dm";
+  sys(convWord);
+
   try {
     const hist = await invoke("get_history", { conversationId: id });
     for (const m of hist) {
       appendMsg(m.body, m.outgoing ? "out" : "in", false, m);
     }
   } catch (e) {
-    sys(String(e));
+    sys(humanError(e));
   }
+  if ($("log").children.length === 0) showIdle();
 }
 
 function buildIndex() {
@@ -255,6 +317,18 @@ function resolveTarget(arg) {
   );
 }
 
+function isValidJoinCode(code) {
+  const c = (code || "").trim().toUpperCase();
+  return c.startsWith("P-") || c.startsWith("R-");
+}
+
+function isOwnPendingCode(code) {
+  if (!code) return false;
+  const norm = code.trim().toUpperCase();
+  if (state.pendingCode && state.pendingCode.toUpperCase() === norm) return true;
+  return false;
+}
+
 async function runCommand(raw) {
   const line = raw.trim();
   const parts = line.split(/\s+/);
@@ -265,19 +339,24 @@ async function runCommand(raw) {
   switch (cmd) {
     case "/help":
     case "/?": {
-      sys("<?>");
-      sys("/connect              peer code (1:1, single-use)");
-      sys("/room                 room code (reusable while open)");
-      sys("/join <code>          peer or room");
-      sys("/who                  connections");
-      sys("/go <n|name>          switch conversation");
-      sys("/name <name>          local label for current");
-      sys("/hist on|off          local history");
-      sys("/wipe                 then /wipe confirm within 10s");
-      sys("/leave                leave current (keeps history)");
-      sys("/file [path]          send file");
-      sys("/demo [1|2]           scripted recording run");
-      sys("/help  /?             this list");
+      sys("<?>", "help");
+      sys("1:1 (dm): /connect gives a P- code (single use, ~10 min). They /join it.");
+      sys("group (room): /room gives an R- code (reuse while you keep the room open).");
+      sys("/join <P-|R-code>  enter someone else's code");
+      sys("/go <n|name>  switch chat (no /leave needed)");
+      sys("/clear  clear the screen only");
+      sys("/wipe  erase saved history on this device (then confirm within 10s)");
+      sys("/who  list dm and group connections");
+      sys("/name <name>  local label for current chat");
+      sys("/hist on|off  local encrypted history");
+      sys("/leave  disconnect current (history stays unless /wipe)");
+      sys("/file [path]  send a file");
+      sys("/demo [1|2]  scripted recording run");
+      break;
+    }
+    case "/clear": {
+      clearScreen();
+      showIdle();
       break;
     }
     case "/demo": {
@@ -290,8 +369,13 @@ async function runCommand(raw) {
       break;
     }
     case "/connect": {
+      if (args.length > 0) {
+        sys("/connect takes no arguments - run it alone for a new P- code");
+        break;
+      }
       const code = await invoke("start_pairing");
       await refreshLists();
+      sysValue("peer code  ", code);
       try {
         await navigator.clipboard.writeText(code);
         sys("copied");
@@ -303,54 +387,70 @@ async function runCommand(raw) {
     case "/room": {
       const [code, topic] = await invoke("start_room");
       await refreshLists();
+      sysValue("room code  ", code);
       try {
         await navigator.clipboard.writeText(code);
         sys("copied");
       } catch {
         /* ignore */
       }
-      await openConv(topic, "room", short(topic), "WAITING");
+      await openConv(topic, "room", short(topic), "WAITING", { force: true });
       break;
     }
     case "/join": {
       if (!args[0]) {
-        sys("usage: /join <code>");
+        sys("usage: /join <P-|R-code>");
         break;
       }
-      const code = args[0];
+      const code = args[0].trim();
+      if (!isValidJoinCode(code)) {
+        sys("codes start with P- (1:1) or R- (group)");
+        break;
+      }
+      if (isOwnPendingCode(code)) {
+        sys("that's your own code - give it to someone else");
+        break;
+      }
       let info;
       try {
         info = await invoke("inspect_code", { code });
       } catch (e) {
-        sys(String(e));
+        sys(humanError(e));
         break;
       }
       if (info.kind === "room") {
         sys(
           info.reachable
-            ? `joining room - ${info.members ?? "?"} present`
-            : "joining room - host not reached yet"
+            ? `joining group - ${info.members ?? "?"} present`
+            : "joining group - host not reached yet"
         );
       } else {
-        sys("connecting to peer");
+        sys("connecting (1:1)");
       }
       try {
         const result = await invoke("join_code", { code });
         await refreshLists();
         if (result.kind === "peer") {
           const p = result.peer;
-          await openConv(p.endpoint_id, "peer", p.label || short(p.endpoint_id), p.path);
+          await openConv(
+            p.endpoint_id,
+            "peer",
+            p.label || short(p.endpoint_id),
+            p.path,
+            { force: true }
+          );
         } else {
           const r = result.room;
           await openConv(
             r.topic_id,
             "room",
             r.label,
-            (r.members || []).length ? "LIVE" : "WAITING"
+            (r.members || []).length ? "LIVE" : "WAITING",
+            { force: true }
           );
         }
       } catch (e) {
-        sys(String(e));
+        sys(humanError(e));
       }
       break;
     }
@@ -361,9 +461,11 @@ async function runCommand(raw) {
         break;
       }
       idx.forEach((c, i) => {
-        const extra =
-          c.kind === "room" ? ` · ${c.members ?? 0}` : "";
-        sys(`${i + 1}. [${c.kind}] ${c.label}  ${c.path}${extra}  ${short(c.id)}`);
+        const kindLabel = c.kind === "room" ? "group" : "dm";
+        const extra = c.kind === "room" ? ` · ${c.members ?? 0}` : "";
+        sys(
+          `${i + 1}. ${kindLabel} ${c.label}  ${c.path}${extra}  ${short(c.id)}`
+        );
       });
       break;
     }
@@ -377,7 +479,7 @@ async function runCommand(raw) {
         sys("not found - /who");
         break;
       }
-      await openConv(t.id, t.kind, t.label, t.path);
+      await openConv(t.id, t.kind, t.label, t.path, { force: true });
       break;
     }
     case "/name": {
@@ -428,7 +530,7 @@ async function runCommand(raw) {
       }
       state.wipeDeadline = Date.now() + 10000;
       sys("clears local copy only - peers keep theirs");
-      sys("confirm: /wipe confirm  (10s)");
+      sys("confirm: /wipe confirm or type confirm (10s)");
       break;
     }
     case "/leave": {
@@ -443,7 +545,8 @@ async function runCommand(raw) {
       state.activeKind = null;
       state.activeLabel = null;
       updateStatusBar();
-      setPath("-");
+      clearScreen();
+      showIdle();
       break;
     }
     case "/file": {
@@ -462,13 +565,26 @@ async function runCommand(raw) {
       try {
         await invoke("send_file", { conversationId: state.active, path });
       } catch (e) {
-        sys(String(e));
+        sys(humanError(e));
       }
       break;
     }
     default:
-      sys(`unknown command - /help`);
+      sys("unknown command - /help");
   }
+}
+
+async function tryWipeConfirm(raw) {
+  if (!state.wipeDeadline || Date.now() > state.wipeDeadline) return false;
+  if (raw.trim().toLowerCase() !== "confirm") return false;
+  if (!state.active) {
+    state.wipeDeadline = 0;
+    return false;
+  }
+  await invoke("wipe_history", { conversationId: state.active });
+  state.wipeDeadline = 0;
+  sys("local history cleared (this device only)");
+  return true;
 }
 
 async function onSubmit() {
@@ -483,10 +599,12 @@ async function onSubmit() {
     try {
       await runCommand(raw.trim());
     } catch (e) {
-      sys(String(e));
+      sys(humanError(e));
     }
     return;
   }
+
+  if (await tryWipeConfirm(raw)) return;
 
   if (!state.active) {
     sys("no conversation - /connect /join /room /go");
@@ -496,7 +614,7 @@ async function onSubmit() {
     await invoke("send_text", { conversationId: state.active, body: raw });
     invoke("send_typing", { conversationId: state.active, active: false });
   } catch (e) {
-    sys(String(e));
+    sys(humanError(e));
   }
 }
 
@@ -519,7 +637,6 @@ async function waitUntil(pred, timeoutMs = 45000) {
   return false;
 }
 
-/** Demo conversation lines. */
 const DEMO_LINES = [
   { from: "host", text: "line still dark?" },
   { from: "peer", text: "dark enough" },
@@ -548,6 +665,7 @@ async function demoConversationHost() {
   sys("> /connect");
   const code = await invoke("start_pairing");
   await refreshLists();
+  sysValue("peer code  ", code);
   await invoke("spawn_demo_peer", { code });
   const ok = await waitUntil(async () => {
     await refreshLists();
@@ -558,7 +676,7 @@ async function demoConversationHost() {
     return;
   }
   const peer = state.peers.find((p) => p.connected);
-  await openConv(peer.endpoint_id, "peer", "wire", peer.path);
+  await openConv(peer.endpoint_id, "peer", "wire", peer.path, { force: true });
   await sleep(600);
   for (const line of DEMO_LINES) {
     if (line.from === "host") {
@@ -569,7 +687,6 @@ async function demoConversationHost() {
       await invoke("send_typing", { conversationId: state.active, active: false });
       await sleep(900);
     } else {
-      // wait for incoming
       await waitUntil(async () => true, 50);
       await sleep(1400);
     }
@@ -592,7 +709,7 @@ async function demoConversationJoiner() {
   await refreshLists();
   if (result.kind === "peer") {
     const p = result.peer;
-    await openConv(p.endpoint_id, "peer", "wire", p.path);
+    await openConv(p.endpoint_id, "peer", "wire", p.path, { force: true });
   }
   await sleep(400);
   for (const line of DEMO_LINES) {
@@ -617,6 +734,7 @@ async function demoCommandsHost() {
   sys("> /connect");
   const code = await invoke("start_pairing");
   await refreshLists();
+  sysValue("peer code  ", code);
   await invoke("spawn_demo_peer", { code });
   const ok = await waitUntil(async () => {
     await refreshLists();
@@ -627,7 +745,13 @@ async function demoCommandsHost() {
     return;
   }
   const peer = state.peers.find((p) => p.connected);
-  await openConv(peer.endpoint_id, "peer", short(peer.endpoint_id), peer.path);
+  await openConv(
+    peer.endpoint_id,
+    "peer",
+    short(peer.endpoint_id),
+    peer.path,
+    { force: true }
+  );
   await sleep(500);
   sys("> ping");
   await invoke("send_typing", { conversationId: state.active, active: true });
@@ -650,13 +774,11 @@ async function demoCommandsJoiner() {
   await refreshLists();
   if (result.kind === "peer") {
     const p = result.peer;
-    await openConv(p.endpoint_id, "peer", short(p.endpoint_id), p.path);
+    await openConv(p.endpoint_id, "peer", short(p.endpoint_id), p.path, {
+      force: true,
+    });
   }
-  // reply to ping
-  await waitUntil(async () => {
-    // loosely wait for a message event via short sleep loop
-    return !!state.active;
-  });
+  await waitUntil(async () => !!state.active);
   await sleep(2500);
   await invoke("send_typing", { conversationId: state.active, active: true });
   await sleep(400);
@@ -691,18 +813,28 @@ async function boot() {
       await refreshLists();
       return;
     }
+    const id = ev.payload.endpoint_id;
+    if (state.myId && id === state.myId) {
+      await refreshLists();
+      return;
+    }
+    if (state.active === id) {
+      await refreshLists();
+      return;
+    }
     await refreshLists();
     await openConv(
-      ev.payload.endpoint_id,
+      id,
       "peer",
-      ev.payload.label || short(ev.payload.endpoint_id),
-      ev.payload.path || "..."
+      ev.payload.label || short(id),
+      ev.payload.path || "...",
+      { force: true }
     );
   });
 
   await listen("conn_path", (ev) => {
     if (ev.payload.conversation_id === state.active) {
-      setPath(ev.payload.path);
+      setPath((ev.payload.path || "").toUpperCase());
     }
     refreshLists();
   });
@@ -713,10 +845,8 @@ async function boot() {
   });
 
   await listen("pairing_expired", () => {
+    clearCodeTimer();
     sys("code expired");
-    clearInterval(state.codeTimer);
-    state.codeTimer = null;
-    state.lastCode = null;
   });
 
   await listen("file_progress", (ev) => {
@@ -747,7 +877,6 @@ async function boot() {
   $("input").focus();
   setInterval(refreshLists, 3000);
 
-  // Auto-start CLI demo
   try {
     const cfg = await invoke("get_launch_config");
     if (cfg.demo) {

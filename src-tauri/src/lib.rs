@@ -21,7 +21,12 @@ fn default_data_dir() -> PathBuf {
 }
 
 fn map_err(e: anyhow::Error) -> String {
-    format!("{e:#}")
+    let s = format!("{e:#}");
+    if s.to_lowercase().contains("ourself") {
+        return "that's your own code - give it to someone else".into();
+    }
+    // keep first clause only
+    s.lines().next().unwrap_or(&s).to_string()
 }
 
 #[derive(Clone, Serialize)]

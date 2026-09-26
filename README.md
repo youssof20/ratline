@@ -58,24 +58,31 @@ ratline --version
 
 One input line. Lines without `/` are chat messages (Enter sends, Shift+Enter is a newline).
 
+**1:1 (dm):** `/connect` gives a `P-` code (single use, ~10 min). The other person runs `/join <code>`.
+
+**Group (room):** `/room` gives an `R-` code (reuse while the room stays open). Others `/join` the same code.
+
+Switch chats with `/go` anytime. You do not need `/leave` first.
+
 ```
-/connect              peer code (1:1, one use, ~10 min)
-/room                 room code (reuse while open)
-/join <code>          peer (P-...) or room (R-...)
-/who                  connections + DIRECT/RELAYED
-/go <n|name>          switch conversation
+/connect              P- code for 1:1 (no arguments)
+/room                 R- code for a group
+/join <P-|R-code>     enter someone else's code
+/go <n|name>          switch dm or group
+/clear                clear the screen only (history stays)
+/who                  list dm/group + path
 /name <name>          local label
 /hist on|off          local encrypted history
-/wipe                 then /wipe confirm within 10s (this device only)
-/leave                leave current (keeps history)
+/wipe                 erase saved history here (then confirm within 10s)
+/leave                leave current chat (history stays unless /wipe)
 /file [path]          send a file
 /demo [1|2]           scripted demo
 /help  /?             commands
 ```
 
-Status bar shows DIRECT or RELAYED.
+Status bar: `dm:` or `group:` for the active chat, path (DIRECT/RELAYED) when connected, and a code countdown while a `P-` invite is live.
 
-In 1:1 chats, `>` is you and `<` is them. In rooms with more than two people, lines use `<name>` instead.
+In 1:1 chats, `>` is you and `<` is them. In groups with more than two people, lines use `<name>` instead.
 
 ## Privacy
 

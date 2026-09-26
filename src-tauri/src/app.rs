@@ -530,6 +530,10 @@ impl App {
     }
 
     pub async fn connect_peer(&self, endpoint_id_hex: &str) -> Result<()> {
+        let me = hex::encode(self.identity.endpoint_id_bytes());
+        if endpoint_id_hex == me {
+            bail!("connecting to ourself is not supported");
+        }
         let id = parse_endpoint_id(endpoint_id_hex)?;
         if self.peers.contains_key(endpoint_id_hex) {
             return Ok(());
@@ -1266,6 +1270,11 @@ async fn run_pairing_host(
                             continue;
                         }
                         let their_hex = hex::encode(their.endpoint_id);
+                        let me = hex::encode(long_term.public().as_bytes());
+                        if their_hex == me {
+                            tracing::warn!("peer joined with our own identity (self-join)");
+                            continue;
+                        }
                         app.storage.upsert_peer(&StoredPeer {
                             endpoint_id: their_hex.clone(),
                             label: their.label.clone(),
@@ -1280,7 +1289,9 @@ async fn run_pairing_host(
                             connected: false,
                             path: "...".into(),
                         });
-                        let _ = app.connect_peer(&their_hex).await;
+                        if let Err(e) = app.connect_peer(&their_hex).await {
+                            tracing::debug!("post-pair connect: {e:#}");
+                        }
                         if single_use {
                             ep.close().await;
                             return Ok(());
@@ -1361,6 +1372,10 @@ async fn run_pairing_join(
     dialer.close().await;
 
     let their_hex = hex::encode(their.endpoint_id);
+    let me = hex::encode(long_term.public().as_bytes());
+    if their_hex == me {
+        bail!("that's your own code - give it to someone else");
+    }
     app.storage.upsert_peer(&StoredPeer {
         endpoint_id: their_hex.clone(),
         label: their.label.clone(),
@@ -1368,7 +1383,9 @@ async fn run_pairing_join(
     })?;
 
     let topic = their.topic_id;
-    let _ = app.connect_peer(&their_hex).await;
+    if let Err(e) = app.connect_peer(&their_hex).await {
+        tracing::debug!("post-join connect: {e:#}");
+    }
 
     Ok((
         PeerInfo {

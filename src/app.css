@@ -20,6 +20,7 @@ html, body {
   font-family: var(--font);
   font-size: 14px;
   overflow: hidden;
+  color-scheme: dark;
 }
 
 body { position: relative; }
@@ -28,15 +29,16 @@ body { position: relative; }
   height: 100%;
   display: flex;
   flex-direction: column;
+  background: var(--bg);
 }
 
 .status {
   display: flex;
-  align-items: center;
+  align-items: baseline;
   gap: var(--s3);
-  padding: var(--s2) var(--s3);
+  padding: 10px 20px 6px;
   font-size: 13px;
-  min-height: 40px;
+  flex-shrink: 0;
 }
 
 .brand {
@@ -51,12 +53,17 @@ body { position: relative; }
   white-space: nowrap;
 }
 
-.path-label {
+.path-label,
+.code-ttl {
   letter-spacing: 0.04em;
   text-transform: uppercase;
   font-size: 11px;
   color: var(--dim);
+  flex-shrink: 0;
 }
+
+.code-ttl.warn { color: var(--warn); }
+.code-ttl.critical { color: var(--danger); }
 
 main {
   flex: 1;
@@ -68,14 +75,30 @@ main {
 .log {
   flex: 1;
   overflow: auto;
-  padding: var(--s3);
-  line-height: 1.5;
+  padding: 8px 20px 12px;
+  line-height: 1.55;
+  scrollbar-width: thin;
+  scrollbar-color: var(--dim) transparent;
+}
+
+.log::-webkit-scrollbar {
+  width: 8px;
+}
+.log::-webkit-scrollbar-track {
+  background: transparent;
+}
+.log::-webkit-scrollbar-thumb {
+  background: var(--dim);
+  border-radius: 0;
+}
+.log::-webkit-scrollbar-thumb:hover {
+  background: var(--fg);
 }
 
 .log .line {
   white-space: pre-wrap;
   word-break: break-word;
-  margin-bottom: var(--s1);
+  margin-bottom: 2px;
   color: var(--fg);
   font-weight: 400;
 }
@@ -97,7 +120,7 @@ main {
 
 .typing {
   min-height: 1.1em;
-  padding: 0 var(--s3) var(--s1);
+  padding: 0 20px 4px;
   font-size: 12px;
 }
 
@@ -105,7 +128,8 @@ main {
   display: flex;
   gap: var(--s2);
   align-items: flex-end;
-  padding: var(--s2) var(--s3);
+  padding: 8px 20px 14px;
+  flex-shrink: 0;
 }
 
 .prompt {
@@ -130,5 +154,3 @@ main {
 }
 
 .dim { color: var(--dim); }
-.ttl-urgent { color: var(--warn); }
-.ttl-critical { color: var(--danger); }
