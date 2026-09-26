@@ -1,0 +1,1382 @@
+//! Application state: endpoint, pairing, chat, gossip, blobs.
+
+use std::collections::HashSet;
+use std::path::PathBuf;
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
+
+use anyhow::{anyhow, bail, Context, Result};
+use dashmap::DashMap;
+use futures_lite::StreamExt;
+use iroh::{
+    endpoint::{presets, Connection, RemoteInfo},
+    protocol::{AcceptError, ProtocolHandler, Router},
+    Endpoint, EndpointId, PublicKey, SecretKey, TransportAddr,
+};
+use iroh_blobs::{store::mem::MemStore, BlobsProtocol, Hash};
+use iroh_gossip::{
+    api::{Event, GossipSender},
+    net::Gossip,
+    proto::TopicId,
+};
+use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
+use tauri::{AppHandle, Emitter};
+use tokio::io::AsyncWriteExt;
+use tokio::sync::mpsc;
+use uuid::Uuid;
+
+use crate::codes::{self, CODE_TTL_SECS};
+use crate::identity::Identity;
+use crate::pairing::{self, IdentityPayload};
+use crate::protocol::{self, ChatMsg, GossipMsg, CHAT_ALPN, PAIR_ALPN};
+use crate::storage::{self, StoredMessage, StoredPeer, StoredRoom, Storage};
+
+static APP_REF: OnceLock<Arc<App>> = OnceLock::new();
+
+pub fn register_app(app: Arc<App>) {
+    let _ = APP_REF.set(app);
+}
+
+fn app_ref() -> Result<Arc<App>> {
+    APP_REF
+        .get()
+        .cloned()
+        .ok_or_else(|| anyhow!("app not ready"))
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct PeerInfo {
+    pub endpoint_id: String,
+    pub label: String,
+    pub connected: bool,
+    pub path: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct RoomInfo {
+    pub topic_id: String,
+    pub label: String,
+    pub members: Vec<String>,
+}
+
+#[derive(Clone, Serialize)]
+pub struct UiMessage {
+    pub id: String,
+    pub conversation_id: String,
+    pub sender_id: String,
+    pub body: String,
+    pub kind: String,
+    pub ts: i64,
+    pub outgoing: bool,
+}
+
+#[derive(Clone, Serialize)]
+pub struct StatusSnapshot {
+    pub endpoint_id: String,
+    pub short_id: String,
+    pub history_enabled: bool,
+    pub pairing_code: Option<String>,
+    pub pairing_expires_in: Option<u64>,
+    pub pairing_kind: Option<String>,
+}
+
+#[derive(Clone, Serialize)]
+pub struct CodeInspect {
+    pub kind: String,
+    pub summary: String,
+    pub members: Option<u32>,
+    pub reachable: bool,
+}
+
+struct PendingPair {
+    code: String,
+    kind: codes::CodeKind,
+    started: Instant,
+    /// Peer codes expire; room codes stay until cancelled.
+    expires: bool,
+    cancel: tokio::sync::watch::Sender<bool>,
+}
+
+struct PeerSession {
+    label: String,
+    send: mpsc::UnboundedSender<Vec<u8>>,
+    path: Arc<Mutex<String>>,
+}
+
+struct RoomSession {
+    sender: GossipSender,
+    members: Arc<Mutex<HashSet<String>>>,
+}
+
+pub struct App {
+    pub identity: Identity,
+    pub storage: Storage,
+    endpoint: Endpoint,
+    gossip: Gossip,
+    blobs: MemStore,
+    _router: Router,
+    peers: DashMap<String, PeerSession>,
+    rooms: DashMap<String, RoomSession>,
+    pending: Mutex<Option<PendingPair>>,
+    dm_gossip: DashMap<String, GossipSender>,
+    app_handle: Mutex<Option<AppHandle>>,
+}
+
+impl App {
+    pub async fn bootstrap(data_dir: PathBuf) -> Result<Arc<Self>> {
+        let identity = Identity::load_or_create(&data_dir)?;
+        let db_key = storage::db_key_from_identity(&identity.secret.to_bytes());
+        let storage = Storage::open(&data_dir, &db_key)?;
+
+        let endpoint = Endpoint::builder(presets::N0)
+            .secret_key(identity.secret.clone())
+            .alpns(vec![
+                CHAT_ALPN.to_vec(),
+                PAIR_ALPN.to_vec(),
+                iroh_gossip::ALPN.to_vec(),
+                iroh_blobs::ALPN.to_vec(),
+            ])
+            .bind()
+            .await
+            .context("bind endpoint")?;
+
+        let gossip = Gossip::builder().spawn(endpoint.clone());
+        let blobs = MemStore::new();
+        let blobs_proto = BlobsProtocol::new(&blobs, None);
+        let chat_handler = ChatAccept::new();
+
+        let router = Router::builder(endpoint.clone())
+            .accept(CHAT_ALPN, chat_handler.clone())
+            .accept(iroh_gossip::ALPN, gossip.clone())
+            .accept(iroh_blobs::ALPN, blobs_proto)
+            .spawn();
+
+        endpoint.online().await;
+
+        let app = Arc::new(Self {
+            identity,
+            storage,
+            endpoint,
+            gossip,
+            blobs,
+            _router: router,
+            peers: DashMap::new(),
+            rooms: DashMap::new(),
+            pending: Mutex::new(None),
+            dm_gossip: DashMap::new(),
+            app_handle: Mutex::new(None),
+        });
+
+        register_app(app.clone());
+        chat_handler.attach(app.clone());
+
+        let boot = app.clone();
+        tokio::spawn(async move {
+            if let Err(e) = boot.reconnect_known().await {
+                tracing::warn!("reconnect: {e:#}");
+            }
+        });
+
+        Ok(app)
+    }
+
+    pub fn set_app_handle(&self, handle: AppHandle) {
+        *self.app_handle.lock() = Some(handle);
+    }
+
+    fn emit<T: Serialize + Clone>(&self, event: &str, payload: T) {
+        if let Some(h) = self.app_handle.lock().as_ref() {
+            let _ = h.emit(event, payload);
+        }
+    }
+
+    pub fn status(&self) -> Result<StatusSnapshot> {
+        let id = self.identity.endpoint_id_bytes();
+        let pending = self.pending.lock();
+        let (code, exp, kind) = match pending.as_ref() {
+            Some(p) => {
+                let left = if p.expires {
+                    Some(CODE_TTL_SECS.saturating_sub(p.started.elapsed().as_secs()))
+                } else {
+                    None
+                };
+                (Some(p.code.clone()), left, Some(p.kind.as_str().to_string()))
+            }
+            None => (None, None, None),
+        };
+        Ok(StatusSnapshot {
+            endpoint_id: hex::encode(id),
+            short_id: codes::short_id(&id),
+            history_enabled: self.storage.history_enabled()?,
+            pairing_code: code,
+            pairing_expires_in: exp,
+            pairing_kind: kind,
+        })
+    }
+
+    pub fn list_peers(&self) -> Result<Vec<PeerInfo>> {
+        let stored = self.storage.list_peers()?;
+        Ok(stored
+            .into_iter()
+            .map(|p| {
+                let sess = self.peers.get(&p.endpoint_id);
+                PeerInfo {
+                    endpoint_id: p.endpoint_id,
+                    label: p.label,
+                    connected: sess.is_some(),
+                    path: sess
+                        .map(|s| s.path.lock().clone())
+                        .unwrap_or_else(|| "OFFLINE".into()),
+                }
+            })
+            .collect())
+    }
+
+    pub fn list_rooms(&self) -> Result<Vec<RoomInfo>> {
+        let stored = self.storage.list_rooms()?;
+        Ok(stored
+            .into_iter()
+            .map(|r| {
+                let members = self
+                    .rooms
+                    .get(&r.topic_id)
+                    .map(|s| s.members.lock().iter().cloned().collect())
+                    .unwrap_or_default();
+                RoomInfo {
+                    topic_id: r.topic_id,
+                    label: r.label,
+                    members,
+                }
+            })
+            .collect())
+    }
+
+    pub async fn start_pairing(&self) -> Result<String> {
+        self.begin_invite(codes::CodeKind::Peer, None).await
+    }
+
+    async fn begin_invite(
+        &self,
+        kind: codes::CodeKind,
+        topic_id: Option<[u8; 32]>,
+    ) -> Result<String> {
+        if let Some(old) = self.pending.lock().take() {
+            let _ = old.cancel.send(true);
+        }
+
+        let code_display = match kind {
+            codes::CodeKind::Peer => codes::generate_peer_code(),
+            codes::CodeKind::Room => codes::generate_room_code(),
+        };
+        let (parsed_kind, body) = codes::parse_code(&code_display)?;
+        let password = codes::password_material(parsed_kind, &body);
+        let expires = matches!(parsed_kind, codes::CodeKind::Peer);
+
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        *self.pending.lock() = Some(PendingPair {
+            code: code_display.clone(),
+            kind: parsed_kind,
+            started: Instant::now(),
+            expires,
+            cancel: cancel_tx,
+        });
+
+        let app = app_ref()?;
+        let long_term = self.identity.secret.clone();
+        let topic_hex = topic_id.map(hex::encode);
+        tokio::spawn(async move {
+            if let Err(e) = run_pairing_host(
+                app,
+                parsed_kind,
+                body,
+                password,
+                long_term,
+                String::new(),
+                topic_id,
+                topic_hex,
+                expires,
+                cancel_rx,
+            )
+            .await
+            {
+                tracing::warn!("invite host: {e:#}");
+            }
+        });
+
+        if expires {
+            let app2 = app_ref()?;
+            let code_check = code_display.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(CODE_TTL_SECS)).await;
+                let mut g = app2.pending.lock();
+                if g.as_ref().map(|p| p.code == code_check).unwrap_or(false) {
+                    if let Some(p) = g.take() {
+                        let _ = p.cancel.send(true);
+                    }
+                    app2.emit("pairing_expired", ());
+                }
+            });
+        }
+
+        Ok(code_display)
+    }
+
+    pub async fn inspect_code(&self, code_input: String) -> Result<CodeInspect> {
+        let (kind, body) = codes::parse_code(&code_input)?;
+        match kind {
+            codes::CodeKind::Peer => Ok(CodeInspect {
+                kind: "peer".into(),
+                summary: "1:1 peer · single-use".into(),
+                members: None,
+                reachable: true,
+            }),
+            codes::CodeKind::Room => {
+                match preview_room(kind, &body).await {
+                    Ok(n) => Ok(CodeInspect {
+                        kind: "room".into(),
+                        summary: format!("room · {n} present"),
+                        members: Some(n),
+                        reachable: true,
+                    }),
+                    Err(_) => Ok(CodeInspect {
+                        kind: "room".into(),
+                        summary: "room · host not reached".into(),
+                        members: None,
+                        reachable: false,
+                    }),
+                }
+            }
+        }
+    }
+
+    pub async fn join_code(&self, code_input: String) -> Result<serde_json::Value> {
+        let (kind, body) = codes::parse_code(&code_input)?;
+        let password = codes::password_material(kind, &body);
+        match kind {
+            codes::CodeKind::Peer => {
+                let (peer, topic) = run_pairing_join(
+                    app_ref()?,
+                    kind,
+                    body,
+                    password,
+                    self.identity.secret.clone(),
+                    String::new(),
+                )
+                .await?;
+                if topic.is_some() {
+                    bail!("peer code returned a room topic — use an R- code for rooms");
+                }
+                Ok(serde_json::json!({ "kind": "peer", "peer": peer }))
+            }
+            codes::CodeKind::Room => {
+                let (peer, topic) = run_pairing_join(
+                    app_ref()?,
+                    kind,
+                    body.clone(),
+                    password,
+                    self.identity.secret.clone(),
+                    String::new(),
+                )
+                .await?;
+                let topic_bytes = topic.unwrap_or_else(|| codes::room_topic_from_code(&body));
+                let topic_hex = hex::encode(topic_bytes);
+                let topic_id = TopicId::from_bytes(topic_bytes);
+                let bootstrap = vec![parse_endpoint_id(&peer.endpoint_id)?];
+                self.storage.upsert_room(&StoredRoom {
+                    topic_id: topic_hex.clone(),
+                    label: format!("room-{}", codes::short_id(&topic_bytes)),
+                    created_at: chrono::Utc::now().timestamp(),
+                })?;
+                self.join_room_inner(topic_id, topic_hex.clone(), bootstrap)
+                    .await?;
+                let room = self
+                    .list_rooms()?
+                    .into_iter()
+                    .find(|r| r.topic_id == topic_hex)
+                    .unwrap_or(RoomInfo {
+                        topic_id: topic_hex,
+                        label: format!("room-{}", codes::short_id(&topic_bytes)),
+                        members: vec![],
+                    });
+                Ok(serde_json::json!({ "kind": "room", "room": room, "peer": peer }))
+            }
+        }
+    }
+
+    pub async fn start_room(&self) -> Result<(String, String)> {
+        let code_display = codes::generate_room_code();
+        let (_kind, body) = codes::parse_code(&code_display)?;
+        let topic_bytes = codes::room_topic_from_code(&body);
+        let topic = TopicId::from_bytes(topic_bytes);
+        let topic_hex = hex::encode(topic_bytes);
+
+        self.storage.upsert_room(&StoredRoom {
+            topic_id: topic_hex.clone(),
+            label: format!("room-{}", codes::short_id(&topic_bytes)),
+            created_at: chrono::Utc::now().timestamp(),
+        })?;
+        self.join_room_inner(topic, topic_hex.clone(), vec![])
+            .await?;
+
+        // Install pending with this exact code (not a fresh generate)
+        if let Some(old) = self.pending.lock().take() {
+            let _ = old.cancel.send(true);
+        }
+        let password = codes::password_material(codes::CodeKind::Room, &body);
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        *self.pending.lock() = Some(PendingPair {
+            code: code_display.clone(),
+            kind: codes::CodeKind::Room,
+            started: Instant::now(),
+            expires: false,
+            cancel: cancel_tx,
+        });
+        let app = app_ref()?;
+        let long_term = self.identity.secret.clone();
+        let topic_hex_clone = topic_hex.clone();
+        tokio::spawn(async move {
+            if let Err(e) = run_pairing_host(
+                app,
+                codes::CodeKind::Room,
+                body,
+                password,
+                long_term,
+                String::new(),
+                Some(topic_bytes),
+                Some(topic_hex_clone),
+                false,
+                cancel_rx,
+            )
+            .await
+            {
+                tracing::warn!("room host: {e:#}");
+            }
+        });
+
+        Ok((code_display, topic_hex))
+    }
+
+    pub async fn join_pairing(&self, code_input: String) -> Result<PeerInfo> {
+        let v = self.join_code(code_input).await?;
+        if v.get("kind").and_then(|k| k.as_str()) == Some("peer") {
+            Ok(serde_json::from_value(v.get("peer").cloned().unwrap())?)
+        } else {
+            bail!("not a peer code")
+        }
+    }
+
+    pub async fn join_room_code(&self, code_input: String) -> Result<RoomInfo> {
+        let v = self.join_code(code_input).await?;
+        if v.get("kind").and_then(|k| k.as_str()) == Some("room") {
+            Ok(serde_json::from_value(v.get("room").cloned().unwrap())?)
+        } else {
+            bail!("not a room code")
+        }
+    }
+
+    async fn join_room_inner(
+        &self,
+        topic: TopicId,
+        topic_hex: String,
+        bootstrap: Vec<EndpointId>,
+    ) -> Result<()> {
+        if self.rooms.contains_key(&topic_hex) {
+            return Ok(());
+        }
+        let gossip_topic = self.gossip.subscribe(topic, bootstrap).await?;
+        let (sender, mut receiver) = gossip_topic.split();
+        let members = Arc::new(Mutex::new(HashSet::new()));
+        let members2 = members.clone();
+        let app = app_ref()?;
+        let tid = topic_hex.clone();
+
+        tokio::spawn(async move {
+            while let Some(ev) = receiver.next().await {
+                match ev {
+                    Ok(Event::Received(msg)) => {
+                        if let Ok(g) = protocol::decode_gossip(&msg.content) {
+                            handle_gossip_event(&app, &tid, g, &members2);
+                        }
+                    }
+                    Ok(Event::NeighborUp(id)) => {
+                        members2.lock().insert(hex::encode(id.as_bytes()));
+                        emit_presence(&app, &tid, &members2);
+                    }
+                    Ok(Event::NeighborDown(id)) => {
+                        members2.lock().remove(&hex::encode(id.as_bytes()));
+                        emit_presence(&app, &tid, &members2);
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        let me = hex::encode(self.identity.endpoint_id_bytes());
+        let payload = protocol::encode_gossip(&GossipMsg::Presence {
+            sender: me,
+            label: String::new(),
+        })?;
+        let _ = sender.broadcast(payload.into()).await;
+
+        self.rooms.insert(
+            topic_hex,
+            RoomSession {
+                sender,
+                members,
+            },
+        );
+        Ok(())
+    }
+
+    pub async fn connect_peer(&self, endpoint_id_hex: &str) -> Result<()> {
+        let id = parse_endpoint_id(endpoint_id_hex)?;
+        if self.peers.contains_key(endpoint_id_hex) {
+            return Ok(());
+        }
+        let conn = self
+            .endpoint
+            .connect(id, CHAT_ALPN)
+            .await
+            .context("connect peer")?;
+        self.spawn_peer_session(conn, true).await
+    }
+
+    async fn reconnect_known(&self) -> Result<()> {
+        for p in self.storage.list_peers()? {
+            if let Err(e) = self.connect_peer(&p.endpoint_id).await {
+                tracing::debug!("could not reach {}: {e:#}", p.endpoint_id);
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn spawn_peer_session(&self, conn: Connection, initiator: bool) -> Result<()> {
+        let remote = conn.remote_id();
+        let remote_hex = hex::encode(remote.as_bytes());
+        if self.peers.contains_key(&remote_hex) {
+            return Ok(());
+        }
+
+        let path = Arc::new(Mutex::new(classify_remote_info_opt(
+            self.endpoint.remote_info(remote).await.as_ref(),
+        )));
+        let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+
+        let (mut send, mut recv) = if initiator {
+            conn.open_bi().await.map_err(|e| anyhow!("open_bi: {e}"))?
+        } else {
+            conn.accept_bi()
+                .await
+                .map_err(|e| anyhow!("accept_bi: {e}"))?
+        };
+
+        if initiator {
+            let hello = protocol::encode_chat(&ChatMsg::Typing { active: false })?;
+            protocol::write_lp(&mut send, &hello).await?;
+        }
+
+        let label = self
+            .storage
+            .list_peers()?
+            .into_iter()
+            .find(|p| p.endpoint_id == remote_hex)
+            .map(|p| p.label)
+            .unwrap_or_default();
+
+        self.storage.upsert_peer(&StoredPeer {
+            endpoint_id: remote_hex.clone(),
+            label: label.clone(),
+            created_at: chrono::Utc::now().timestamp(),
+        })?;
+
+        self.peers.insert(
+            remote_hex.clone(),
+            PeerSession {
+                label: label.clone(),
+                send: tx,
+                path: path.clone(),
+            },
+        );
+
+        let my_id = self.identity.endpoint_id_bytes();
+        let mut their_id = [0u8; 32];
+        their_id.copy_from_slice(remote.as_bytes());
+        let topic_bytes = codes::dm_topic_id(&my_id, &their_id);
+        let topic = TopicId::from_bytes(topic_bytes);
+        if let Ok(gt) = self.gossip.subscribe(topic, vec![remote]).await {
+            let (gsend, mut grec) = gt.split();
+            self.dm_gossip.insert(remote_hex.clone(), gsend);
+            let app = app_ref()?;
+            let conv = remote_hex.clone();
+            tokio::spawn(async move {
+                while let Some(ev) = grec.next().await {
+                    if let Ok(Event::Received(msg)) = ev {
+                        if let Ok(GossipMsg::Typing { active, .. }) =
+                            protocol::decode_gossip(&msg.content)
+                        {
+                            app.emit(
+                                "typing",
+                                serde_json::json!({ "conversation_id": conv, "active": active }),
+                            );
+                        }
+                    }
+                }
+            });
+        }
+
+        self.emit(
+            "peer_update",
+            PeerInfo {
+                endpoint_id: remote_hex.clone(),
+                label,
+                connected: true,
+                path: path.lock().clone(),
+            },
+        );
+
+        tokio::spawn(async move {
+            while let Some(payload) = rx.recv().await {
+                if protocol::write_lp(&mut send, &payload).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let app = app_ref()?;
+        let conv = remote_hex.clone();
+        let path_watch = path.clone();
+        let endpoint = self.endpoint.clone();
+        tokio::spawn(async move {
+            let path_task = {
+                let path_watch = path_watch.clone();
+                let endpoint = endpoint.clone();
+                let app = app.clone();
+                let conv = conv.clone();
+                tokio::spawn(async move {
+                    loop {
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        if let Some(info) = endpoint.remote_info(remote).await {
+                            let p = classify_remote_info(&info);
+                            let mut cur = path_watch.lock();
+                            if *cur != p {
+                                *cur = p.clone();
+                                app.emit(
+                                    "conn_path",
+                                    serde_json::json!({ "conversation_id": conv, "path": p }),
+                                );
+                            }
+                        }
+                    }
+                })
+            };
+
+            loop {
+                match protocol::read_lp(&mut recv, 1_000_000).await {
+                    Ok(buf) => {
+                        if let Ok(msg) = protocol::decode_chat(&buf) {
+                            handle_chat_incoming(&app, &conv, msg);
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            path_task.abort();
+            app.peers.remove(&conv);
+            app.emit(
+                "peer_update",
+                PeerInfo {
+                    endpoint_id: conv,
+                    label: String::new(),
+                    connected: false,
+                    path: "OFFLINE".into(),
+                },
+            );
+        });
+
+        Ok(())
+    }
+
+    pub async fn send_text(&self, conversation_id: &str, body: String) -> Result<UiMessage> {
+        let id = Uuid::new_v4().to_string();
+        let ts = chrono::Utc::now().timestamp();
+        let me = hex::encode(self.identity.endpoint_id_bytes());
+
+        if let Some(room) = self.rooms.get(conversation_id) {
+            let g = GossipMsg::Chat {
+                id: id.clone(),
+                sender: me.clone(),
+                body: body.clone(),
+                ts,
+            };
+            room.sender
+                .broadcast(protocol::encode_gossip(&g)?.into())
+                .await?;
+        } else if let Some(peer) = self.peers.get(conversation_id) {
+            let msg = ChatMsg::Text {
+                id: id.clone(),
+                body: body.clone(),
+                ts,
+            };
+            peer.send
+                .send(protocol::encode_chat(&msg)?)
+                .map_err(|_| anyhow!("peer send channel closed"))?;
+        } else {
+            self.connect_peer(conversation_id).await?;
+            return Box::pin(self.send_text(conversation_id, body)).await;
+        }
+
+        let stored = StoredMessage {
+            id: id.clone(),
+            conversation_id: conversation_id.into(),
+            sender_id: me.clone(),
+            body: body.clone(),
+            kind: "text".into(),
+            created_at: ts,
+        };
+        self.storage.insert_message(&stored)?;
+
+        let ui = UiMessage {
+            id,
+            conversation_id: conversation_id.into(),
+            sender_id: me,
+            body,
+            kind: "text".into(),
+            ts,
+            outgoing: true,
+        };
+        self.emit("message", ui.clone());
+        Ok(ui)
+    }
+
+    pub async fn send_typing(&self, conversation_id: &str, active: bool) -> Result<()> {
+        let me = hex::encode(self.identity.endpoint_id_bytes());
+        let g = GossipMsg::Typing {
+            sender: me,
+            active,
+        };
+        let payload = protocol::encode_gossip(&g)?;
+        if let Some(room) = self.rooms.get(conversation_id) {
+            room.sender.broadcast(payload.into()).await?;
+        } else if let Some(gs) = self.dm_gossip.get(conversation_id) {
+            gs.broadcast(payload.into()).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn send_file(&self, conversation_id: &str, path: PathBuf) -> Result<UiMessage> {
+        self.emit(
+            "file_progress",
+            serde_json::json!({ "conversation_id": conversation_id, "pct": 5, "phase": "read" }),
+        );
+        let data = tokio::fs::read(&path).await?;
+        self.emit(
+            "file_progress",
+            serde_json::json!({ "conversation_id": conversation_id, "pct": 40, "phase": "hash" }),
+        );
+        let name = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("file")
+            .to_string();
+        let size = data.len() as u64;
+        let tag = self.blobs.add_slice(&data).await?;
+        self.emit(
+            "file_progress",
+            serde_json::json!({ "conversation_id": conversation_id, "pct": 75, "phase": "offer" }),
+        );
+        let hash_hex = tag.hash.to_string();
+
+        let id = Uuid::new_v4().to_string();
+        let ts = chrono::Utc::now().timestamp();
+        let me = hex::encode(self.identity.endpoint_id_bytes());
+        let body = format!("FILE {name} ({size}b) {hash_hex}");
+
+        if let Some(room) = self.rooms.get(conversation_id) {
+            let g = GossipMsg::FileOffer {
+                id: id.clone(),
+                sender: me.clone(),
+                name: name.clone(),
+                size,
+                hash: hash_hex.clone(),
+                ts,
+            };
+            room.sender
+                .broadcast(protocol::encode_gossip(&g)?.into())
+                .await?;
+        } else if let Some(peer) = self.peers.get(conversation_id) {
+            let msg = ChatMsg::FileOffer {
+                id: id.clone(),
+                name,
+                size,
+                hash: hash_hex,
+                ts,
+            };
+            peer.send
+                .send(protocol::encode_chat(&msg)?)
+                .map_err(|_| anyhow!("send closed"))?;
+        } else {
+            bail!("not connected");
+        }
+
+        self.storage.insert_message(&StoredMessage {
+            id: id.clone(),
+            conversation_id: conversation_id.into(),
+            sender_id: me.clone(),
+            body: body.clone(),
+            kind: "file".into(),
+            created_at: ts,
+        })?;
+
+        let ui = UiMessage {
+            id,
+            conversation_id: conversation_id.into(),
+            sender_id: me,
+            body,
+            kind: "file".into(),
+            ts,
+            outgoing: true,
+        };
+        self.emit(
+            "file_progress",
+            serde_json::json!({ "conversation_id": conversation_id, "pct": 100, "phase": "done" }),
+        );
+        self.emit("message", ui.clone());
+        Ok(ui)
+    }
+
+    pub async fn download_file(
+        &self,
+        from_endpoint: &str,
+        hash_hex: &str,
+        dest: PathBuf,
+    ) -> Result<()> {
+        let peer = parse_endpoint_id(from_endpoint)?;
+        let hash: Hash = hash_hex.parse().context("hash")?;
+        let conn = self
+            .endpoint
+            .connect(peer, iroh_blobs::ALPN)
+            .await
+            .context("connect for blob")?;
+        self.blobs
+            .remote()
+            .fetch(conn, hash)
+            .complete()
+            .await
+            .context("blob fetch")?;
+        let bytes = self.blobs.get_bytes(hash).await.context("get bytes")?;
+        tokio::fs::write(dest, &bytes).await?;
+        Ok(())
+    }
+
+    pub fn history(&self, conversation_id: &str) -> Result<Vec<UiMessage>> {
+        let me = hex::encode(self.identity.endpoint_id_bytes());
+        Ok(self
+            .storage
+            .messages_for(conversation_id, 500)?
+            .into_iter()
+            .map(|m| UiMessage {
+                outgoing: m.sender_id == me,
+                id: m.id,
+                conversation_id: m.conversation_id,
+                sender_id: m.sender_id,
+                body: m.body,
+                kind: m.kind,
+                ts: m.created_at,
+            })
+            .collect())
+    }
+
+    pub fn wipe(&self, conversation_id: &str) -> Result<usize> {
+        self.storage.wipe_conversation(conversation_id)
+    }
+
+    pub fn set_history(&self, on: bool) -> Result<()> {
+        self.storage.set_history_enabled(on)
+    }
+
+    pub fn set_label(&self, endpoint_id: &str, label: &str) -> Result<()> {
+        if !self.storage.set_peer_label(endpoint_id, label)? {
+            anyhow::bail!("unknown peer");
+        }
+        Ok(())
+    }
+
+    pub fn set_conv_label(&self, conversation_id: &str, label: &str) -> Result<()> {
+        if self.storage.set_peer_label(conversation_id, label)? {
+            return Ok(());
+        }
+        if self.storage.set_room_label(conversation_id, label)? {
+            return Ok(());
+        }
+        anyhow::bail!("unknown conversation")
+    }
+
+    pub fn leave(&self, conversation_id: &str) -> Result<()> {
+        if self.rooms.remove(conversation_id).is_some() {
+            return Ok(());
+        }
+        self.peers.remove(conversation_id);
+        Ok(())
+    }
+}
+
+fn emit_presence(app: &App, tid: &str, members: &Arc<Mutex<HashSet<String>>>) {
+    app.emit(
+        "presence",
+        serde_json::json!({
+            "topic": tid,
+            "members": members.lock().iter().cloned().collect::<Vec<_>>()
+        }),
+    );
+}
+
+fn parse_endpoint_id(hex_str: &str) -> Result<EndpointId> {
+    let bytes = hex::decode(hex_str).context("hex endpoint id")?;
+    if bytes.len() != 32 {
+        bail!("endpoint id must be 32 bytes");
+    }
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&bytes);
+    PublicKey::from_bytes(&arr).map_err(|e| anyhow!("{e}"))
+}
+
+fn classify_remote_info_opt(info: Option<&RemoteInfo>) -> String {
+    match info {
+        Some(i) => classify_remote_info(i),
+        None => "…".into(),
+    }
+}
+
+fn classify_remote_info(info: &RemoteInfo) -> String {
+    let mut direct = false;
+    let mut relay = false;
+    for addr in info.addrs() {
+        match addr.addr() {
+            TransportAddr::Ip(_) => direct = true,
+            TransportAddr::Relay(_) => relay = true,
+            _ => {}
+        }
+    }
+    if direct {
+        "DIRECT".into()
+    } else if relay {
+        "RELAYED".into()
+    } else {
+        "UNKNOWN".into()
+    }
+}
+
+fn handle_chat_incoming(app: &App, conv: &str, msg: ChatMsg) {
+    match msg {
+        ChatMsg::Text { id, body, ts } => {
+            let sender = conv.to_string();
+            let _ = app.storage.insert_message(&StoredMessage {
+                id: id.clone(),
+                conversation_id: conv.into(),
+                sender_id: sender.clone(),
+                body: body.clone(),
+                kind: "text".into(),
+                created_at: ts,
+            });
+            app.emit(
+                "message",
+                UiMessage {
+                    id,
+                    conversation_id: conv.into(),
+                    sender_id: sender,
+                    body,
+                    kind: "text".into(),
+                    ts,
+                    outgoing: false,
+                },
+            );
+        }
+        ChatMsg::FileOffer {
+            id,
+            name,
+            size,
+            hash,
+            ts,
+        } => {
+            let body = format!("FILE {name} ({size}b) {hash}");
+            let _ = app.storage.insert_message(&StoredMessage {
+                id: id.clone(),
+                conversation_id: conv.into(),
+                sender_id: conv.into(),
+                body: body.clone(),
+                kind: "file".into(),
+                created_at: ts,
+            });
+            app.emit(
+                "message",
+                UiMessage {
+                    id,
+                    conversation_id: conv.into(),
+                    sender_id: conv.into(),
+                    body,
+                    kind: "file".into(),
+                    ts,
+                    outgoing: false,
+                },
+            );
+        }
+        ChatMsg::Typing { active } => {
+            app.emit(
+                "typing",
+                serde_json::json!({ "conversation_id": conv, "active": active }),
+            );
+        }
+    }
+}
+
+fn handle_gossip_event(
+    app: &App,
+    topic: &str,
+    g: GossipMsg,
+    members: &Arc<Mutex<HashSet<String>>>,
+) {
+    match g {
+        GossipMsg::Chat {
+            id,
+            sender,
+            body,
+            ts,
+        } => {
+            let me = hex::encode(app.identity.endpoint_id_bytes());
+            if sender == me {
+                return;
+            }
+            let _ = app.storage.insert_message(&StoredMessage {
+                id: id.clone(),
+                conversation_id: topic.into(),
+                sender_id: sender.clone(),
+                body: body.clone(),
+                kind: "text".into(),
+                created_at: ts,
+            });
+            app.emit(
+                "message",
+                UiMessage {
+                    id,
+                    conversation_id: topic.into(),
+                    sender_id: sender,
+                    body,
+                    kind: "text".into(),
+                    ts,
+                    outgoing: false,
+                },
+            );
+        }
+        GossipMsg::Typing { sender, active } => {
+            app.emit(
+                "typing",
+                serde_json::json!({ "conversation_id": topic, "sender": sender, "active": active }),
+            );
+        }
+        GossipMsg::FileOffer {
+            id,
+            sender,
+            name,
+            size,
+            hash,
+            ts,
+        } => {
+            let body = format!("FILE {name} ({size}b) {hash}");
+            let _ = app.storage.insert_message(&StoredMessage {
+                id: id.clone(),
+                conversation_id: topic.into(),
+                sender_id: sender.clone(),
+                body: body.clone(),
+                kind: "file".into(),
+                created_at: ts,
+            });
+            app.emit(
+                "message",
+                UiMessage {
+                    id,
+                    conversation_id: topic.into(),
+                    sender_id: sender,
+                    body,
+                    kind: "file".into(),
+                    ts,
+                    outgoing: false,
+                },
+            );
+        }
+        GossipMsg::Presence { sender, .. } => {
+            members.lock().insert(sender);
+            emit_presence(app, topic, members);
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+struct ChatAccept {
+    app: Arc<Mutex<Option<Arc<App>>>>,
+}
+
+impl std::fmt::Debug for ChatAccept {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChatAccept").finish_non_exhaustive()
+    }
+}
+
+impl ChatAccept {
+    fn new() -> Self {
+        Self {
+            app: Arc::new(Mutex::new(None)),
+        }
+    }
+    fn attach(&self, app: Arc<App>) {
+        *self.app.lock() = Some(app);
+    }
+}
+
+impl ProtocolHandler for ChatAccept {
+    fn accept(
+        &self,
+        connection: Connection,
+    ) -> impl std::future::Future<Output = Result<(), AcceptError>> + Send {
+        let app = self.app.lock().clone();
+        async move {
+            if let Some(app) = app {
+                if let Err(e) = app.spawn_peer_session(connection, false).await {
+                    tracing::warn!("chat accept: {e:#}");
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+async fn pair_as_host(
+    conn: Connection,
+    password: &str,
+    mine: &IdentityPayload,
+) -> Result<IdentityPayload> {
+    let role = pairing::start_a(password);
+    let my_spake_msg = role.outbound.clone();
+    let (mut send, mut recv) = conn.accept_bi().await?;
+
+    let (kind, their_spake) = pairing::read_frame(&mut recv).await?;
+    if kind != pairing::FRAME_SPAKE {
+        bail!("expected SPAKE frame");
+    }
+    let session = pairing::finish_a(role, &their_spake)?;
+
+    send.write_all(&pairing::encode_frame(pairing::FRAME_SPAKE, &my_spake_msg))
+        .await?;
+
+    let sealed = pairing::seal_payload(&session, mine)?;
+    send.write_all(&pairing::encode_frame(pairing::FRAME_IDENTITY, &sealed))
+        .await?;
+
+    let (kind, their_ct) = pairing::read_frame(&mut recv).await?;
+    if kind != pairing::FRAME_IDENTITY {
+        bail!("expected identity");
+    }
+    pairing::open_payload(&session, &their_ct)
+}
+
+async fn pair_as_joiner(
+    conn: Connection,
+    password: &str,
+    mine: &IdentityPayload,
+) -> Result<IdentityPayload> {
+    let role = pairing::start_b(password);
+    let my_spake_msg = role.outbound.clone();
+    let (mut send, mut recv) = conn.open_bi().await?;
+
+    send.write_all(&pairing::encode_frame(pairing::FRAME_SPAKE, &my_spake_msg))
+        .await?;
+
+    let (kind, their_spake) = pairing::read_frame(&mut recv).await?;
+    if kind != pairing::FRAME_SPAKE {
+        bail!("expected SPAKE frame");
+    }
+    let session = pairing::finish_b(role, &their_spake)?;
+
+    let sealed = pairing::seal_payload(&session, mine)?;
+    send.write_all(&pairing::encode_frame(pairing::FRAME_IDENTITY, &sealed))
+        .await?;
+
+    let (kind, their_ct) = pairing::read_frame(&mut recv).await?;
+    if kind != pairing::FRAME_IDENTITY {
+        bail!("expected identity");
+    }
+    pairing::open_payload(&session, &their_ct)
+}
+
+async fn run_pairing_host(
+    app: Arc<App>,
+    kind: codes::CodeKind,
+    _body: String,
+    password: String,
+    long_term: SecretKey,
+    label: String,
+    topic_id: Option<[u8; 32]>,
+    topic_hex: Option<String>,
+    single_use: bool,
+    mut cancel: tokio::sync::watch::Receiver<bool>,
+) -> Result<()> {
+    let eph = codes::ephemeral_secret(kind, &_body);
+    let ep = Endpoint::builder(presets::N0)
+        .secret_key(eph)
+        .alpns(vec![PAIR_ALPN.to_vec()])
+        .bind()
+        .await?;
+    ep.online().await;
+
+    loop {
+        let member_count = topic_hex.as_ref().and_then(|th| {
+            app.rooms
+                .get(th)
+                .map(|r| r.members.lock().len() as u32 + 1) // include self
+        });
+
+        let my_payload = IdentityPayload {
+            endpoint_id: {
+                let mut a = [0u8; 32];
+                a.copy_from_slice(long_term.public().as_bytes());
+                a
+            },
+            label: label.clone(),
+            topic_id,
+            member_count,
+        };
+
+        tokio::select! {
+            _ = cancel.changed() => {
+                if *cancel.borrow() {
+                    ep.close().await;
+                    return Ok(());
+                }
+            }
+            incoming = ep.accept() => {
+                let Some(incoming) = incoming else { break; };
+                let conn = match incoming.await {
+                    Ok(c) => c,
+                    Err(e) => { tracing::warn!("incoming: {e}"); continue; }
+                };
+                match pair_as_host(conn, &password, &my_payload).await {
+                    Ok(their) => {
+                        if their.endpoint_id.iter().all(|&b| b == 0) {
+                            // inspect probe — ignore
+                            continue;
+                        }
+                        let their_hex = hex::encode(their.endpoint_id);
+                        app.storage.upsert_peer(&StoredPeer {
+                            endpoint_id: their_hex.clone(),
+                            label: their.label.clone(),
+                            created_at: chrono::Utc::now().timestamp(),
+                        })?;
+                        if single_use {
+                            *app.pending.lock() = None;
+                        }
+                        app.emit("paired", PeerInfo {
+                            endpoint_id: their_hex.clone(),
+                            label: their.label,
+                            connected: false,
+                            path: "…".into(),
+                        });
+                        let _ = app.connect_peer(&their_hex).await;
+                        if single_use {
+                            ep.close().await;
+                            return Ok(());
+                        }
+                        // room: keep listening for more joiners
+                    }
+                    Err(e) => tracing::warn!("pair attempt failed: {e:#}"),
+                }
+            }
+        }
+    }
+    ep.close().await;
+    Ok(())
+}
+
+async fn preview_room(kind: codes::CodeKind, body: &str) -> Result<u32> {
+    let password = codes::password_material(kind, body);
+    let eph = codes::ephemeral_secret(kind, body);
+    let dialer = Endpoint::builder(presets::N0)
+        .secret_key(SecretKey::generate())
+        .bind()
+        .await?;
+    dialer.online().await;
+    let conn = tokio::time::timeout(
+        Duration::from_secs(8),
+        dialer.connect(eph.public(), PAIR_ALPN),
+    )
+    .await
+    .context("timeout")?
+    .context("dial")?;
+
+    // Lightweight: SPAKE then read host identity for member_count, then drop
+    let mine = IdentityPayload {
+        endpoint_id: [0u8; 32],
+        label: String::new(),
+        topic_id: None,
+        member_count: None,
+    };
+    let their = pair_as_joiner(conn, &password, &mine).await?;
+    dialer.close().await;
+    Ok(their.member_count.unwrap_or(1))
+}
+
+async fn run_pairing_join(
+    app: Arc<App>,
+    kind: codes::CodeKind,
+    body: String,
+    password: String,
+    long_term: SecretKey,
+    label: String,
+) -> Result<(PeerInfo, Option<[u8; 32]>)> {
+    let eph = codes::ephemeral_secret(kind, &body);
+    let eph_id = eph.public();
+
+    let dialer = Endpoint::builder(presets::N0)
+        .secret_key(SecretKey::generate())
+        .bind()
+        .await?;
+    dialer.online().await;
+
+    let conn = dialer
+        .connect(eph_id, PAIR_ALPN)
+        .await
+        .context("dial pairing host (is the code valid / still active?)")?;
+
+    let mine = IdentityPayload {
+        endpoint_id: {
+            let mut a = [0u8; 32];
+            a.copy_from_slice(long_term.public().as_bytes());
+            a
+        },
+        label,
+        topic_id: None,
+        member_count: None,
+    };
+
+    let their = pair_as_joiner(conn, &password, &mine).await?;
+    dialer.close().await;
+
+    let their_hex = hex::encode(their.endpoint_id);
+    app.storage.upsert_peer(&StoredPeer {
+        endpoint_id: their_hex.clone(),
+        label: their.label.clone(),
+        created_at: chrono::Utc::now().timestamp(),
+    })?;
+
+    let topic = their.topic_id;
+    let _ = app.connect_peer(&their_hex).await;
+
+    Ok((
+        PeerInfo {
+            endpoint_id: their_hex,
+            label: their.label,
+            connected: true,
+            path: "…".into(),
+        },
+        topic,
+    ))
+}

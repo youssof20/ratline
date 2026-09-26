@@ -1,0 +1,16 @@
+{
+  "name": "ratline",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Minimal peer-to-peer encrypted chat",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "dev": "node node_modules/@tauri-apps/cli/tauri.js dev",
+    "build": "node node_modules/@tauri-apps/cli/tauri.js build",
+    "tauri": "node node_modules/@tauri-apps/cli/tauri.js"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2"
+  }
+}

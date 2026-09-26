@@ -1,0 +1,22 @@
+node_modules/
+dist/
+src-tauri/target/
+.DS_Store
+*.log
+.idea/
+.vscode/
+history.db
+identity.json
+
+# Agent / AI session artifacts — never publish
+AGENTS.md
+CLAUDE.md
+.claude/
+.cursor/
+.codex/
+.continue/
+*.plan.md
+*-plan.md
+scratch/
+.tmp/
+.agent/

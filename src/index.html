@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ratline</title>
+  <link rel="stylesheet" href="app.css" />
+</head>
+<body>
+  <div class="crt">
+    <header class="status">
+      <span class="brand">ratline</span>
+      <span id="short-id" class="dim" title="your id">····</span>
+      <span id="status-conv" class="status-conv dim">—</span>
+      <span id="path-badge" class="path-badge" title="connection">
+        <span id="path-dot" class="dot offline"></span>
+        <span id="path-label">—</span>
+      </span>
+    </header>
+
+    <main>
+      <div id="log" class="log" aria-live="polite"></div>
+      <div id="typing" class="typing dim"></div>
+      <form id="composer">
+        <span class="prompt">&gt;</span>
+        <textarea id="input" rows="1" autocomplete="off" spellcheck="false"></textarea>
+      </form>
+    </main>
+  </div>
+  <div class="scanlines"></div>
+  <script type="module" src="app.js"></script>
+</body>
+</html>

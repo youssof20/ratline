@@ -1,0 +1,62 @@
+[package]
+name = "ratline"
+version = "0.1.0"
+description = "Minimal peer-to-peer encrypted chat"
+authors = ["Ratline contributors"]
+edition = "2021"
+license = "MIT"
+
+[lib]
+name = "ratline_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+dirs = "6"
+hex = "0.4"
+data-encoding = "2"
+rand = "0.8"
+blake3 = "1"
+bytes = "1"
+futures-lite = "2"
+n0-future = "0.3"
+chrono = { version = "0.4", features = ["serde", "clock"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+parking_lot = "0.12"
+dashmap = "6"
+
+# P2P / crypto
+iroh = "1.2"
+iroh-gossip = { version = "0.101", features = ["net"] }
+iroh-blobs = "0.103"
+spake2 = "0.4"
+chacha20poly1305 = "0.10"
+zeroize = { version = "1", features = ["derive"] }
+
+# Local history DB. Bodies encrypted at rest with ChaCha20-Poly1305 (see storage.rs).
+# (Full SQLCipher needs a system OpenSSL/Perl toolchain on Windows; field encryption
+# keeps the same threat model for chat content without that build dependency.)
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true
