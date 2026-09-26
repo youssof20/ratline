@@ -5,6 +5,7 @@ mod identity;
 mod pairing;
 mod protocol;
 mod storage;
+mod update;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -231,6 +232,16 @@ async fn get_launch_config(state: tauri::State<'_, LaunchArgs>) -> Result<Launch
     })
 }
 
+#[tauri::command]
+async fn check_update() -> Result<update::UpdateInfo, String> {
+    update::check_update().await.map_err(map_err)
+}
+
+#[tauri::command]
+async fn run_update(app: tauri::AppHandle) -> Result<(), String> {
+    update::run_update(app).await.map_err(map_err)
+}
+
 /// Host-only: spawn a second process that joins with the given code.
 #[tauri::command]
 async fn spawn_demo_peer(
@@ -333,6 +344,8 @@ pub fn run_with_args(args: LaunchArgs) {
             pick_save,
             get_launch_config,
             spawn_demo_peer,
+            check_update,
+            run_update,
         ])
         .run(tauri::generate_context!())
         .expect("error while running ratline");

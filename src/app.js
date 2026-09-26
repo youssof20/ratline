@@ -151,6 +151,25 @@ function sysValue(prefix, value, suffix) {
   log.scrollTop = log.scrollHeight;
 }
 
+/** In-place progress line so the terminal doesn't flood. */
+function sysProgress(text) {
+  const log = $("log");
+  clearIdle();
+  let line = log.querySelector(".line.sys.progress");
+  if (!line) {
+    line = document.createElement("div");
+    line.className = "line sys progress";
+    log.appendChild(line);
+  }
+  line.textContent = text;
+  log.scrollTop = log.scrollHeight;
+}
+
+function clearProgress() {
+  const line = $("log").querySelector(".line.sys.progress");
+  if (line) line.remove();
+}
+
 function appendMsg(body, cls, _unused, meta) {
   const log = $("log");
   clearIdle();
@@ -367,7 +386,26 @@ async function runCommand(raw) {
       sys("/hist on|off  local encrypted history");
       sys("/leave  disconnect current (history stays unless /wipe)");
       sys("/file [path]  send a file");
+      sys("/update  check GitHub and install latest");
       sys("/demo [1|2]  scripted recording run");
+      break;
+    }
+    case "/update": {
+      try {
+        const info = await invoke("check_update");
+        if (!info.available) {
+          sys(`up to date · ${info.current}`, "ok");
+          break;
+        }
+        sysValue("update  ", `${info.current} → ${info.latest}`);
+        if (info.notes) sys(info.notes.slice(0, 120));
+        sys("downloading…");
+        await invoke("run_update");
+        sys("installer launched · restarting", "ok");
+      } catch (e) {
+        clearProgress();
+        sys(humanError(e));
+      }
       break;
     }
     case "/clear": {
@@ -834,6 +872,16 @@ async function boot() {
   showIdle();
   await refreshLists();
 
+  // Soft nudge if GitHub has a newer release (never blocks boot).
+  invoke("check_update")
+    .then((info) => {
+      if (info?.available) {
+        sysValue("update  ", `${info.current} → ${info.latest}`);
+        sys("type /update");
+      }
+    })
+    .catch(() => {});
+
   await listen("message", (ev) => {
     const m = ev.payload;
     if (m.conversation_id !== state.active) return;
@@ -889,6 +937,19 @@ async function boot() {
     if (ev.payload.conversation_id !== state.active) return;
     if (ev.payload.pct >= 100) return;
     sys(`file ${ev.payload.pct}% · ${ev.payload.phase}`);
+  });
+
+  await listen("update_progress", (ev) => {
+    const p = ev.payload || {};
+    if (p.phase === "install") {
+      sysProgress(`${p.bar}  installing ${p.to}`);
+      return;
+    }
+    if (p.phase === "start") {
+      sysProgress(`${p.bar}  ${p.from} → ${p.to}`);
+      return;
+    }
+    sysProgress(`${p.bar}  ${p.to}`);
   });
 
   $("input").addEventListener("input", () => {

@@ -76,6 +76,7 @@ Switch chats with `/go` anytime. You do not need `/leave` first.
 /wipe                 erase saved history here (then confirm within 10s)
 /leave                leave current chat (history stays unless /wipe)
 /file [path]          send a file
+/update               check GitHub and install latest
 /demo [1|2]           scripted demo
 /help  /?             commands
 ```
