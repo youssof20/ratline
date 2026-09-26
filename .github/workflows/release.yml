@@ -1,0 +1,113 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest
+            args: --target aarch64-apple-darwin
+            rust_target: aarch64-apple-darwin
+          - platform: macos-latest
+            args: --target x86_64-apple-darwin
+            rust_target: x86_64-apple-darwin
+          - platform: ubuntu-22.04
+            args: ""
+            rust_target: ""
+          - platform: windows-latest
+            args: ""
+            rust_target: ""
+
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+
+      - name: Install Linux deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+
+      - name: Install frontend deps
+        run: npm ci
+
+      - name: Build and upload
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: Ratline ${{ github.ref_name }}
+          releaseBody: |
+            Download the build for your OS below.
+
+            Checksums (SHA-256) will be added in a follow-up job after all platforms finish.
+          releaseDraft: false
+          prerelease: false
+          args: ${{ matrix.args }}
+
+  checksums:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve release
+        id: rel
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json id,tagName
+
+      - name: Download release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p assets-dl
+          gh release download "${{ steps.rel.outputs.tag }}" --repo "$GITHUB_REPOSITORY" --dir assets-dl
+          ls -la assets-dl
+
+      - name: Generate SHA-256 checksums
+        run: |
+          cd assets-dl
+          find . -type f ! -name 'SHA256SUMS' -print0 | sort -z | xargs -0 sha256sum > ../SHA256SUMS
+          cd ..
+          echo "### SHA-256" > notes.md
+          echo "" >> notes.md
+          echo '```' >> notes.md
+          cat SHA256SUMS >> notes.md
+          echo '```' >> notes.md
+          cat notes.md
+
+      - name: Upload checksums and update notes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ steps.rel.outputs.tag }}" SHA256SUMS --repo "$GITHUB_REPOSITORY" --clobber
+          BODY=$(gh release view "${{ steps.rel.outputs.tag }}" --repo "$GITHUB_REPOSITORY" --json body -q .body)
+          {
+            echo "$BODY"
+            echo ""
+            cat notes.md
+          } > body.md
+          gh release edit "${{ steps.rel.outputs.tag }}" --repo "$GITHUB_REPOSITORY" --notes-file body.md

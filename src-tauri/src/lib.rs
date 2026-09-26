@@ -1,3 +1,4 @@
+pub mod cli;
 mod app;
 mod codes;
 mod identity;
@@ -9,9 +10,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use app::{App, CodeInspect, PeerInfo, RoomInfo, StatusSnapshot, UiMessage};
+use cli::{DemoKind, DemoRole, LaunchArgs};
+use serde::Serialize;
 use tauri::Manager;
 
-fn data_dir() -> PathBuf {
+fn default_data_dir() -> PathBuf {
     dirs::data_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("ratline")
@@ -19,6 +22,14 @@ fn data_dir() -> PathBuf {
 
 fn map_err(e: anyhow::Error) -> String {
     format!("{e:#}")
+}
+
+#[derive(Clone, Serialize)]
+struct LaunchConfig {
+    demo: Option<String>,
+    role: String,
+    demo_code: Option<String>,
+    version: String,
 }
 
 #[tauri::command]
@@ -205,8 +216,50 @@ async fn pick_save(app: tauri::AppHandle, default_name: String) -> Result<Option
     .map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+async fn get_launch_config(state: tauri::State<'_, LaunchArgs>) -> Result<LaunchConfig, String> {
+    Ok(LaunchConfig {
+        demo: state.demo.map(|d| d.as_str().to_string()),
+        role: state.demo_role.as_str().to_string(),
+        demo_code: state.demo_code.clone(),
+        version: env!("CARGO_PKG_VERSION").into(),
+    })
+}
+
+/// Host-only: spawn a second process that joins with the given code.
+#[tauri::command]
+async fn spawn_demo_peer(
+    launch: tauri::State<'_, LaunchArgs>,
+    code: String,
+) -> Result<(), String> {
+    let demo = launch
+        .demo
+        .ok_or_else(|| "not in demo mode".to_string())?;
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let peer_dir = std::env::temp_dir().join(format!(
+        "ratline-demo-{}-joiner",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&peer_dir);
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("--demo")
+        .arg(demo.as_str())
+        .arg("--demo-role")
+        .arg("joiner")
+        .arg("--demo-code")
+        .arg(&code)
+        .arg("--data-dir")
+        .arg(&peer_dir);
+    cmd.spawn().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    run_with_args(cli::parse_args(std::env::args()));
+}
+
+pub fn run_with_args(args: LaunchArgs) {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -214,11 +267,38 @@ pub fn run() {
         )
         .init();
 
+    let data = args
+        .data_dir
+        .clone()
+        .unwrap_or_else(default_data_dir);
+
+    // Demo host gets an isolated data dir so it never touches the user's identity.
+    let data = if args.demo.is_some() && args.data_dir.is_none() {
+        let d = std::env::temp_dir().join(format!("ratline-demo-{}-host", std::process::id()));
+        let _ = std::fs::create_dir_all(&d);
+        d
+    } else {
+        data
+    };
+
+    let window_title = match (args.demo, args.demo_role) {
+        (Some(DemoKind::Conversation), DemoRole::Host) => "ratline · demo a",
+        (Some(DemoKind::Conversation), DemoRole::Joiner) => "ratline · demo b",
+        (Some(DemoKind::Commands), DemoRole::Host) => "ratline · demo host",
+        (Some(DemoKind::Commands), DemoRole::Joiner) => "ratline · demo peer",
+        _ => "ratline",
+    };
+
+    let args_managed = args.clone();
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .setup(|app| {
+        .manage(args_managed)
+        .setup(move |app| {
+            if let Some(w) = app.get_webview_window("main") {
+                let _ = w.set_title(window_title);
+            }
             let handle = app.handle().clone();
-            let state = tauri::async_runtime::block_on(App::bootstrap(data_dir()))
+            let state = tauri::async_runtime::block_on(App::bootstrap(data))
                 .expect("bootstrap ratline");
             state.set_app_handle(handle);
             app.manage(state);
@@ -246,6 +326,8 @@ pub fn run() {
             leave_conversation,
             pick_file,
             pick_save,
+            get_launch_config,
+            spawn_demo_peer,
         ])
         .run(tauri::generate_context!())
         .expect("error while running ratline");

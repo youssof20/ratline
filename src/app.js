@@ -11,7 +11,8 @@ const state = {
   wipeDeadline: 0,
   codeTimer: null,
   lastCode: null,
-  index: [], // from /who for /go N
+  index: [],
+  demoRunning: false,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -281,7 +282,17 @@ async function runCommand(raw) {
       sys("/wipe                 then /wipe confirm within 10s");
       sys("/leave                leave current (keeps history)");
       sys("/file [path]          send file");
+      sys("/demo [1|2]           scripted recording run");
       sys("/help  /?             this list");
+      break;
+    }
+    case "/demo": {
+      const which = args[0] || "1";
+      const kind =
+        which === "2" || which === "commands" || which === "cmd"
+          ? "commands"
+          : "conversation";
+      await runDemo(kind, "host");
       break;
     }
     case "/connect": {
@@ -501,6 +512,173 @@ function autoSize() {
   el.style.height = Math.min(el.scrollHeight, 120) + "px";
 }
 
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+async function waitUntil(pred, timeoutMs = 45000) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    if (await pred()) return true;
+    await sleep(200);
+  }
+  return false;
+}
+
+/** Original demo dialogue — terse, not film quotes. */
+const DEMO_LINES = [
+  { from: "host", text: "line still dark?" },
+  { from: "peer", text: "dark enough" },
+  { from: "host", text: "relay saw us once" },
+  { from: "peer", text: "then we cut it" },
+  { from: "host", text: "hold" },
+];
+
+async function runDemo(kind, role) {
+  state.demoRunning = true;
+  try {
+    if (kind === "conversation") {
+      if (role === "joiner") await demoConversationJoiner();
+      else await demoConversationHost();
+    } else {
+      if (role === "joiner") await demoCommandsJoiner();
+      else await demoCommandsHost();
+    }
+  } finally {
+    state.demoRunning = false;
+  }
+}
+
+async function demoConversationHost() {
+  sys("demo · conversation");
+  sys("> /connect");
+  const code = await invoke("start_pairing");
+  await refreshLists();
+  await invoke("spawn_demo_peer", { code });
+  const ok = await waitUntil(async () => {
+    await refreshLists();
+    return state.peers.some((p) => p.connected);
+  });
+  if (!ok) {
+    sys("demo: peer did not connect");
+    return;
+  }
+  const peer = state.peers.find((p) => p.connected);
+  await openConv(peer.endpoint_id, "peer", "wire", peer.path);
+  await sleep(600);
+  for (const line of DEMO_LINES) {
+    if (line.from === "host") {
+      await sleep(400);
+      await invoke("send_typing", { conversationId: state.active, active: true });
+      await sleep(500);
+      await invoke("send_text", { conversationId: state.active, body: line.text });
+      await invoke("send_typing", { conversationId: state.active, active: false });
+      await sleep(900);
+    } else {
+      // wait for incoming
+      await waitUntil(async () => true, 50);
+      await sleep(1400);
+    }
+  }
+  await sleep(800);
+  showIdleMarkOnly();
+}
+
+async function demoConversationJoiner() {
+  const cfg = await invoke("get_launch_config");
+  const code = cfg.demo_code;
+  if (!code) {
+    sys("demo joiner: no code");
+    return;
+  }
+  await sleep(1500);
+  sys("demo · joiner");
+  sys(`> /join ${code}`);
+  const result = await invoke("join_code", { code });
+  await refreshLists();
+  if (result.kind === "peer") {
+    const p = result.peer;
+    await openConv(p.endpoint_id, "peer", "wire", p.path);
+  }
+  await sleep(400);
+  for (const line of DEMO_LINES) {
+    if (line.from === "peer") {
+      await sleep(700);
+      await invoke("send_typing", { conversationId: state.active, active: true });
+      await sleep(450);
+      await invoke("send_text", { conversationId: state.active, body: line.text });
+      await invoke("send_typing", { conversationId: state.active, active: false });
+      await sleep(800);
+    } else {
+      await sleep(1200);
+    }
+  }
+  await sleep(600);
+  showIdleMarkOnly();
+}
+
+async function demoCommandsHost() {
+  sys("demo · commands");
+  await sleep(400);
+  sys("> /connect");
+  const code = await invoke("start_pairing");
+  await refreshLists();
+  await invoke("spawn_demo_peer", { code });
+  const ok = await waitUntil(async () => {
+    await refreshLists();
+    return state.peers.some((p) => p.connected);
+  }, 60000);
+  if (!ok) {
+    sys("demo: peer did not connect");
+    return;
+  }
+  const peer = state.peers.find((p) => p.connected);
+  await openConv(peer.endpoint_id, "peer", short(peer.endpoint_id), peer.path);
+  await sleep(500);
+  sys("> ping");
+  await invoke("send_typing", { conversationId: state.active, active: true });
+  await sleep(600);
+  await invoke("send_text", { conversationId: state.active, body: "ping" });
+  await invoke("send_typing", { conversationId: state.active, active: false });
+  await sleep(1800);
+  sys("> /who");
+  await runCommand("/who");
+  await sleep(1200);
+}
+
+async function demoCommandsJoiner() {
+  const cfg = await invoke("get_launch_config");
+  const code = cfg.demo_code;
+  if (!code) return;
+  await sleep(2000);
+  sys(`> /join ${code}`);
+  const result = await invoke("join_code", { code });
+  await refreshLists();
+  if (result.kind === "peer") {
+    const p = result.peer;
+    await openConv(p.endpoint_id, "peer", short(p.endpoint_id), p.path);
+  }
+  // reply to ping
+  await waitUntil(async () => {
+    // loosely wait for a message event via short sleep loop
+    return !!state.active;
+  });
+  await sleep(2500);
+  await invoke("send_typing", { conversationId: state.active, active: true });
+  await sleep(400);
+  await invoke("send_text", { conversationId: state.active, body: "pong" });
+  await invoke("send_typing", { conversationId: state.active, active: false });
+}
+
+function showIdleMarkOnly() {
+  const log = $("log");
+  const mark = document.createElement("div");
+  mark.className = "idle-mark";
+  mark.innerHTML = '&lt;?&gt;<span class="block-cursor"></span>';
+  log.appendChild(mark);
+  log.scrollTop = log.scrollHeight;
+}
+
 async function boot() {
   showIdle();
   await refreshLists();
@@ -515,6 +693,10 @@ async function boot() {
   await listen("presence", () => refreshLists());
 
   await listen("paired", async (ev) => {
+    if (state.demoRunning) {
+      await refreshLists();
+      return;
+    }
     await refreshLists();
     await openConv(
       ev.payload.endpoint_id,
@@ -570,6 +752,17 @@ async function boot() {
 
   $("input").focus();
   setInterval(refreshLists, 3000);
+
+  // Auto-start CLI demo
+  try {
+    const cfg = await invoke("get_launch_config");
+    if (cfg.demo) {
+      await sleep(800);
+      await runDemo(cfg.demo, cfg.role === "joiner" ? "joiner" : "host");
+    }
+  } catch {
+    /* ignore */
+  }
 }
 
 boot().catch((e) => {
