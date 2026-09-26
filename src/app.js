@@ -58,13 +58,23 @@ function clearCodeTimer() {
 }
 
 function setPath(path) {
-  state.path = path || "";
-  $("path-label").textContent = state.path;
+  const next = (path || "").toUpperCase();
+  const prev = state.path;
+  state.path = next;
+  const el = $("path-label");
+  el.textContent = state.path;
+  if (next === "DIRECT" && prev !== "DIRECT") {
+    el.classList.remove("live");
+    void el.offsetWidth;
+    el.classList.add("live");
+  } else if (next !== "DIRECT") {
+    el.classList.remove("live");
+  }
 }
 
 function updateStatusBar() {
   if (!state.active) {
-    $("status-conv").textContent = "-";
+    $("status-conv").textContent = "";
     setPath("");
     return;
   }
@@ -114,7 +124,13 @@ function sys(text, cls) {
   const log = $("log");
   clearIdle();
   const line = document.createElement("div");
-  line.className = `line sys ${cls || ""}`.trim();
+  let kind = cls || "";
+  if (!kind && /own code|could not|unknown|not found|too slow|expired/i.test(t)) {
+    kind = "err";
+  } else if (!kind && /copied|connected|DIRECT|joined|named |history on|erased/i.test(t)) {
+    kind = "ok";
+  }
+  line.className = `line sys ${kind}`.trim();
   line.textContent = t;
   log.appendChild(line);
   log.scrollTop = log.scrollHeight;
@@ -439,15 +455,18 @@ async function runCommand(raw) {
             p.path,
             { force: true }
           );
+          sys("line live", "ok");
         } else {
           const r = result.room;
+          const live = (r.members || []).length > 0;
           await openConv(
             r.topic_id,
             "room",
             r.label,
-            (r.members || []).length ? "LIVE" : "WAITING",
+            live ? "LIVE" : "WAITING",
             { force: true }
           );
+          sys(live ? "group live" : "waiting for others", "ok");
         }
       } catch (e) {
         sys(humanError(e));
@@ -795,7 +814,23 @@ function showIdleMarkOnly() {
   log.scrollTop = log.scrollHeight;
 }
 
+async function playBoot() {
+  const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  const bootEl = $("boot");
+  const appEl = $("app");
+  if (reduce || !bootEl) {
+    if (bootEl) bootEl.classList.add("done");
+    if (appEl) appEl.classList.add("ready");
+    return;
+  }
+  await sleep(1600);
+  bootEl.classList.add("done");
+  appEl.classList.add("ready");
+  await sleep(200);
+}
+
 async function boot() {
+  await playBoot();
   showIdle();
   await refreshLists();
 
@@ -827,9 +862,10 @@ async function boot() {
       id,
       "peer",
       ev.payload.label || short(id),
-      ev.payload.path || "...",
+      ev.payload.path || "DIRECT",
       { force: true }
     );
+    sys("line live", "ok");
   });
 
   await listen("conn_path", (ev) => {
@@ -880,7 +916,7 @@ async function boot() {
   try {
     const cfg = await invoke("get_launch_config");
     if (cfg.demo) {
-      await sleep(800);
+      await sleep(400);
       await runDemo(cfg.demo, cfg.role === "joiner" ? "joiner" : "host");
     }
   } catch {

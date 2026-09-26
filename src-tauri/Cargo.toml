@@ -1,6 +1,6 @@
 [package]
 name = "ratline"
-version = "0.2.2"
+version = "0.2.3"
 description = "Minimal peer-to-peer encrypted chat"
 authors = ["Ratline contributors"]
 edition = "2021"

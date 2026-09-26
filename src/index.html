@@ -7,12 +7,18 @@
   <link rel="stylesheet" href="app.css" />
 </head>
 <body>
-  <div class="app">
+  <div id="boot" class="boot" aria-hidden="true">
+    <div class="boot-brand">ratline</div>
+    <div class="boot-bar"><i></i></div>
+    <div class="boot-mark">&lt;?&gt;</div>
+  </div>
+
+  <div class="app" id="app">
     <header class="status">
       <span class="brand">ratline</span>
       <span id="short-id" class="dim" title="your id">····</span>
-      <span id="status-conv" class="status-conv dim">-</span>
-      <span id="path-label" class="path-label">-</span>
+      <span id="status-conv" class="status-conv dim"></span>
+      <span id="path-label" class="path-label"></span>
       <span id="code-ttl" class="code-ttl"></span>
     </header>
 
@@ -21,7 +27,7 @@
       <div id="typing" class="typing dim"></div>
       <form id="composer">
         <span class="prompt">&gt;</span>
-        <textarea id="input" rows="1" autocomplete="off" spellcheck="false"></textarea>
+        <textarea id="input" rows="1" autocomplete="off" spellcheck="false" placeholder=""></textarea>
       </form>
     </main>
   </div>
