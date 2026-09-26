@@ -114,6 +114,9 @@ pub fn ensure_console() {
     }
 }
 
+#[cfg(not(windows))]
+pub fn ensure_console() {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
