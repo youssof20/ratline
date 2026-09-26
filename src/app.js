@@ -1,6 +1,24 @@
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
 
+const COMMANDS = [
+  "/help",
+  "/connect",
+  "/join",
+  "/room",
+  "/go",
+  "/who",
+  "/clear",
+  "/wipe",
+  "/name",
+  "/hist",
+  "/leave",
+  "/file",
+  "/update",
+  "/version",
+  "/demo",
+];
+
 const state = {
   active: null,
   activeKind: null,
@@ -12,12 +30,16 @@ const state = {
   codeTimer: null,
   lastCode: null,
   pendingCode: null,
+  lastCopiedCode: null,
   myShort: "",
   myId: "",
   lastSys: "",
   lastSysAt: 0,
   index: [],
   demoRunning: false,
+  typingTimer: null,
+  typingStopTimer: null,
+  lastPeerOnline: {},
 };
 
 const $ = (id) => document.getElementById(id);
@@ -32,11 +54,14 @@ function humanError(err) {
     return "that's your own code - give it to someone else";
   }
   if (/No addressing information|pkarr|TXT record|dns/i.test(s)) {
-    return "could not find host - code expired, wrong, or they are offline";
+    return "could not find them - code expired, wrong, or offline";
   }
   const line = s.split("\n")[0].trim();
   if (/^dial pairing host/i.test(line)) {
-    return "could not reach host (code invalid or expired?)";
+    return "could not reach them (code invalid or expired?)";
+  }
+  if (/already on latest/i.test(line)) {
+    return line;
   }
   if (line.length > 120) {
     return line.slice(0, 117) + "...";
@@ -57,18 +82,42 @@ function clearCodeTimer() {
   setCodeTtl("");
 }
 
+function prettyPath(path) {
+  const p = (path || "").toUpperCase();
+  if (!p || p === "...") return "linking…";
+  if (p === "DIRECT") return "direct";
+  if (p === "RELAYED") return "relayed";
+  if (p === "OFFLINE") return "offline";
+  if (p === "WAITING") return "waiting";
+  if (p === "LIVE") return "live";
+  return p.toLowerCase();
+}
+
 function setPath(path) {
-  const next = (path || "").toUpperCase();
+  const raw = (path || "").toUpperCase();
   const prev = state.path;
-  state.path = next;
+  state.path = raw;
   const el = $("path-label");
-  el.textContent = state.path;
-  if (next === "DIRECT" && prev !== "DIRECT") {
-    el.classList.remove("live");
-    void el.offsetWidth;
-    el.classList.add("live");
-  } else if (next !== "DIRECT") {
-    el.classList.remove("live");
+  el.textContent = prettyPath(raw);
+  el.classList.remove("live", "relay", "wait", "offline");
+  if (raw === "DIRECT") {
+    if (prev !== "DIRECT") {
+      void el.offsetWidth;
+      el.classList.add("live");
+    } else {
+      el.classList.add("live");
+    }
+  } else if (raw === "RELAYED") {
+    if (prev !== "RELAYED") {
+      void el.offsetWidth;
+      el.classList.add("relay");
+    } else {
+      el.classList.add("relay");
+    }
+  } else if (raw === "WAITING" || raw === "...") {
+    el.classList.add("wait");
+  } else if (raw === "OFFLINE") {
+    el.classList.add("offline");
   }
 }
 
@@ -76,11 +125,23 @@ function updateStatusBar() {
   if (!state.active) {
     $("status-conv").textContent = "";
     setPath("");
+    updatePlaceholder();
     return;
   }
   const tag = state.activeKind === "room" ? "group" : "dm";
   const name = state.activeLabel || short(state.active);
   $("status-conv").textContent = `${tag}:${name}`;
+  updatePlaceholder();
+}
+
+function updatePlaceholder() {
+  const el = $("input");
+  if (!el) return;
+  if (state.active) {
+    el.placeholder = "message";
+  } else {
+    el.placeholder = "/connect  /join  /help";
+  }
 }
 
 function roomMemberCount() {
@@ -110,8 +171,8 @@ function clearScreen() {
 }
 
 function clearIdle() {
-  const idle = $("log").querySelector(".idle-mark");
-  if (idle) idle.remove();
+  const log = $("log");
+  log.querySelectorAll(".idle-mark, .idle-hint").forEach((n) => n.remove());
 }
 
 function sys(text, cls) {
@@ -125,9 +186,9 @@ function sys(text, cls) {
   clearIdle();
   const line = document.createElement("div");
   let kind = cls || "";
-  if (!kind && /own code|could not|unknown|not found|too slow|expired/i.test(t)) {
+  if (!kind && /own code|could not|unknown|not found|too slow|expired|offline/i.test(t)) {
     kind = "err";
-  } else if (!kind && /copied|connected|DIRECT|joined|named |history on|erased/i.test(t)) {
+  } else if (!kind && /copied|connected|direct|joined|named |history on|erased|line live|group live|up to date/i.test(t)) {
     kind = "ok";
   }
   line.className = `line sys ${kind}`.trim();
@@ -145,13 +206,23 @@ function sysValue(prefix, value, suffix) {
   const val = document.createElement("span");
   val.className = "val";
   val.textContent = value;
+  val.title = "click to copy";
+  val.onclick = async (e) => {
+    e.stopPropagation();
+    try {
+      await navigator.clipboard.writeText(value);
+      state.lastCopiedCode = value;
+      sys("copied", "ok");
+    } catch {
+      /* ignore */
+    }
+  };
   line.appendChild(val);
   if (suffix) line.appendChild(document.createTextNode(suffix));
   log.appendChild(line);
   log.scrollTop = log.scrollHeight;
 }
 
-/** In-place progress line so the terminal doesn't flood. */
 function sysProgress(text) {
   const log = $("log");
   clearIdle();
@@ -170,12 +241,13 @@ function clearProgress() {
   if (line) line.remove();
 }
 
-function appendMsg(body, cls, _unused, meta) {
+function appendMsg(body, cls, opts = {}, meta) {
+  if (!opts || typeof opts !== "object") opts = {};
   const log = $("log");
   clearIdle();
 
   const line = document.createElement("div");
-  line.className = `line ${cls}`;
+  line.className = `line ${cls}${opts.hist ? " hist" : ""}`;
   log.appendChild(line);
 
   if (meta?.kind === "file") {
@@ -192,7 +264,7 @@ function appendMsg(body, cls, _unused, meta) {
           hash: m[3],
           dest,
         });
-        sys(`saved ${m[1]}`);
+        sys(`saved ${m[1]}`, "ok");
       } catch (e) {
         sys(humanError(e));
       }
@@ -211,15 +283,36 @@ function appendMsg(body, cls, _unused, meta) {
   log.scrollTop = log.scrollHeight;
 }
 
-function showIdle() {
+function showIdle(mode = "home") {
   const log = $("log");
   if (log.querySelector(".idle-mark")) return;
   if (log.children.length > 0) return;
+
   const mark = document.createElement("div");
   mark.className = "idle-mark";
   mark.textContent = "<?>";
   log.appendChild(mark);
-  sys("type /help");
+
+  if (mode === "home") {
+    const a = document.createElement("div");
+    a.className = "idle-hint";
+    a.textContent = "one line. encrypted.";
+    log.appendChild(a);
+    const b = document.createElement("div");
+    b.className = "idle-hint";
+    b.textContent = "/connect  ·  /join  ·  /help";
+    log.appendChild(b);
+  } else if (mode === "chat") {
+    const a = document.createElement("div");
+    a.className = "idle-hint";
+    a.textContent = "quiet";
+    log.appendChild(a);
+  } else if (mode === "waiting") {
+    const a = document.createElement("div");
+    a.className = "idle-hint";
+    a.textContent = "waiting…";
+    log.appendChild(a);
+  }
 }
 
 async function refreshLists() {
@@ -229,8 +322,21 @@ async function refreshLists() {
   $("short-id").textContent = state.myShort || "····";
   state.pendingCode = status.pairing_code || null;
 
+  const prevPeers = state.peers;
   state.peers = await invoke("list_peers");
   state.rooms = await invoke("list_rooms");
+
+  // Soft disconnect notice for active dm
+  if (state.active && state.activeKind === "peer") {
+    const p = state.peers.find((x) => x.endpoint_id === state.active);
+    const was = prevPeers.find((x) => x.endpoint_id === state.active);
+    if (p && was?.connected && !p.connected) {
+      sys("line dropped", "err");
+      $("typing").textContent = "";
+    } else if (p && was && !was.connected && p.connected) {
+      sys("line live", "ok");
+    }
+  }
 
   if (state.active && state.activeKind === "peer") {
     const p = state.peers.find((x) => x.endpoint_id === state.active);
@@ -261,7 +367,7 @@ async function refreshLists() {
 
 function trackCodeExpiry(code, kind, secs) {
   if (kind === "room") {
-    setCodeTtl("ROOM CODE");
+    setCodeTtl("room");
     return;
   }
   if (state.lastCode === code && state.codeTimer) return;
@@ -281,7 +387,7 @@ function trackCodeExpiry(code, kind, secs) {
     const m = Math.floor(left / 60);
     const s = left % 60;
     const label =
-      m > 0 ? `CODE ${m}:${String(s).padStart(2, "0")}` : `CODE ${left}s`;
+      m > 0 ? `${m}:${String(s).padStart(2, "0")}` : `${left}s`;
     setCodeTtl(label, cls);
     left -= 1;
   };
@@ -299,18 +405,21 @@ async function openConv(id, kind, label, path, opts = {}) {
   setPath(path || "");
   updateStatusBar();
   clearScreen();
-  const convWord = kind === "room" ? "group" : "dm";
-  sys(convWord);
 
   try {
     const hist = await invoke("get_history", { conversationId: id });
     for (const m of hist) {
-      appendMsg(m.body, m.outgoing ? "out" : "in", false, m);
+      appendMsg(m.body, m.outgoing ? "out" : "in", { hist: true }, m);
     }
   } catch (e) {
     sys(humanError(e));
   }
-  if ($("log").children.length === 0) showIdle();
+
+  if ($("log").children.length === 0) {
+    const waiting =
+      kind === "room" && (!path || String(path).toUpperCase() === "WAITING");
+    showIdle(waiting ? "waiting" : "chat");
+  }
 }
 
 function buildIndex() {
@@ -364,30 +473,77 @@ function isOwnPendingCode(code) {
   return false;
 }
 
+function listWho() {
+  const idx = buildIndex();
+  if (!idx.length) {
+    sys("no connections");
+    return;
+  }
+  idx.forEach((c, i) => {
+    const kindLabel = c.kind === "room" ? "group" : "dm";
+    const extra = c.kind === "room" ? ` · ${c.members ?? 0}` : "";
+    sys(
+      `${i + 1}. ${kindLabel} ${c.label}  ${prettyPath(c.path)}${extra}  ${short(c.id)}`
+    );
+  });
+}
+
+async function copyCode(code) {
+  state.lastCopiedCode = code;
+  try {
+    await navigator.clipboard.writeText(code);
+    sys("copied", "ok");
+  } catch {
+    /* ignore */
+  }
+}
+
+function normalizeCommand(cmd) {
+  const map = {
+    "/c": "/connect",
+    "/j": "/join",
+    "/r": "/room",
+    "/h": "/help",
+    "/w": "/who",
+    "/u": "/update",
+    "/v": "/version",
+    "/?": "/help",
+  };
+  return map[cmd] || cmd;
+}
+
 async function runCommand(raw) {
   const line = raw.trim();
   const parts = line.split(/\s+/);
-  const cmd = parts[0].toLowerCase();
+  const cmd = normalizeCommand(parts[0].toLowerCase());
   const args = parts.slice(1);
   const rest = line.slice(parts[0].length).trim();
 
   switch (cmd) {
-    case "/help":
-    case "/?": {
+    case "/help": {
+      if (args[0] === "more" || args[0] === "all") {
+        sys("<?>", "help");
+        sys("/name <name>  local label for current chat");
+        sys("/hist on|off  local encrypted history");
+        sys("/wipe  erase saved history here (confirm in 10s)");
+        sys("/leave  disconnect current");
+        sys("/file [path]  send a file");
+        sys("/update  install latest from GitHub");
+        sys("/version  show build");
+        sys("/demo [1|2]  scripted recording run");
+        break;
+      }
       sys("<?>", "help");
-      sys("1:1 (dm): /connect gives a P- code (single use, ~10 min). They /join it.");
-      sys("group (room): /room gives an R- code (reuse while you keep the room open).");
-      sys("/join <P-|R-code>  enter someone else's code");
-      sys("/go <n|name>  switch chat (no /leave needed)");
-      sys("/clear  clear the screen only");
-      sys("/wipe  erase saved history on this device (then confirm within 10s)");
-      sys("/who  list dm and group connections");
-      sys("/name <name>  local label for current chat");
-      sys("/hist on|off  local encrypted history");
-      sys("/leave  disconnect current (history stays unless /wipe)");
-      sys("/file [path]  send a file");
-      sys("/update  check GitHub and install latest");
-      sys("/demo [1|2]  scripted recording run");
+      sys("/connect  P- code for 1:1  ·  they /join it");
+      sys("/room  R- code for a group");
+      sys("/join <code>  enter theirs");
+      sys("/go <n|name>  switch  ·  /who  list  ·  /clear");
+      sys("/help more");
+      break;
+    }
+    case "/version": {
+      const cfg = await invoke("get_launch_config");
+      sys(`ratline v${cfg.version}`, "ok");
       break;
     }
     case "/update": {
@@ -410,7 +566,7 @@ async function runCommand(raw) {
     }
     case "/clear": {
       clearScreen();
-      showIdle();
+      showIdle(state.active ? "chat" : "home");
       break;
     }
     case "/demo": {
@@ -424,30 +580,20 @@ async function runCommand(raw) {
     }
     case "/connect": {
       if (args.length > 0) {
-        sys("/connect takes no arguments - run it alone for a new P- code");
+        sys("/connect takes no arguments");
         break;
       }
       const code = await invoke("start_pairing");
       await refreshLists();
-      sysValue("peer code  ", code);
-      try {
-        await navigator.clipboard.writeText(code);
-        sys("copied");
-      } catch {
-        /* ignore */
-      }
+      sysValue("code  ", code);
+      await copyCode(code);
       break;
     }
     case "/room": {
       const [code, topic] = await invoke("start_room");
       await refreshLists();
-      sysValue("room code  ", code);
-      try {
-        await navigator.clipboard.writeText(code);
-        sys("copied");
-      } catch {
-        /* ignore */
-      }
+      sysValue("code  ", code);
+      await copyCode(code);
       await openConv(topic, "room", short(topic), "WAITING", { force: true });
       break;
     }
@@ -456,79 +602,16 @@ async function runCommand(raw) {
         sys("usage: /join <P-|R-code>");
         break;
       }
-      const code = args[0].trim();
-      if (!isValidJoinCode(code)) {
-        sys("codes start with P- (1:1) or R- (group)");
-        break;
-      }
-      if (isOwnPendingCode(code)) {
-        sys("that's your own code - give it to someone else");
-        break;
-      }
-      let info;
-      try {
-        info = await invoke("inspect_code", { code });
-      } catch (e) {
-        sys(humanError(e));
-        break;
-      }
-      if (info.kind === "room") {
-        sys(
-          info.reachable
-            ? `joining group - ${info.members ?? "?"} present`
-            : "joining group - host not reached yet"
-        );
-      } else {
-        sys("connecting (1:1)");
-      }
-      try {
-        const result = await invoke("join_code", { code });
-        await refreshLists();
-        if (result.kind === "peer") {
-          const p = result.peer;
-          await openConv(
-            p.endpoint_id,
-            "peer",
-            p.label || short(p.endpoint_id),
-            p.path,
-            { force: true }
-          );
-          sys("line live", "ok");
-        } else {
-          const r = result.room;
-          const live = (r.members || []).length > 0;
-          await openConv(
-            r.topic_id,
-            "room",
-            r.label,
-            live ? "LIVE" : "WAITING",
-            { force: true }
-          );
-          sys(live ? "group live" : "waiting for others", "ok");
-        }
-      } catch (e) {
-        sys(humanError(e));
-      }
+      await doJoin(args[0].trim());
       break;
     }
     case "/who": {
-      const idx = buildIndex();
-      if (!idx.length) {
-        sys("no connections");
-        break;
-      }
-      idx.forEach((c, i) => {
-        const kindLabel = c.kind === "room" ? "group" : "dm";
-        const extra = c.kind === "room" ? ` · ${c.members ?? 0}` : "";
-        sys(
-          `${i + 1}. ${kindLabel} ${c.label}  ${c.path}${extra}  ${short(c.id)}`
-        );
-      });
+      listWho();
       break;
     }
     case "/go": {
       if (!args[0]) {
-        sys("usage: /go <n|name>");
+        listWho();
         break;
       }
       const t = resolveTarget(args[0]);
@@ -551,23 +634,19 @@ async function runCommand(raw) {
       await invoke("set_label", { endpointId: state.active, label: rest });
       state.activeLabel = rest;
       updateStatusBar();
-      sys(`named ${rest} (local only)`);
+      sys(`named ${rest}`, "ok");
       break;
     }
     case "/hist": {
       const mode = (args[0] || "").toLowerCase();
       if (mode !== "on" && mode !== "off") {
         const s = await invoke("get_status");
-        sys(`history: ${s.history_enabled ? "on" : "off"} - saved locally, encrypted.`);
+        sys(`history ${s.history_enabled ? "on" : "off"} · local, encrypted`);
         break;
       }
       const on = mode === "on";
       await invoke("set_history", { enabled: on });
-      sys(
-        on
-          ? "history: on - saved locally, encrypted."
-          : "history: off - new messages not kept."
-      );
+      sys(on ? "history on · local, encrypted" : "history off · nothing new kept");
       break;
     }
     case "/wipe": {
@@ -582,12 +661,12 @@ async function runCommand(raw) {
         }
         await invoke("wipe_history", { conversationId: state.active });
         state.wipeDeadline = 0;
-        sys("local history cleared (this device only)");
+        sys("local history cleared", "ok");
         break;
       }
       state.wipeDeadline = Date.now() + 10000;
-      sys("clears local copy only - peers keep theirs");
-      sys("confirm: /wipe confirm or type confirm (10s)");
+      sys("clears local copy only");
+      sys("confirm: /wipe confirm  (10s)");
       break;
     }
     case "/leave": {
@@ -596,14 +675,15 @@ async function runCommand(raw) {
         break;
       }
       const id = state.active;
+      const label = state.activeLabel || short(id);
       await invoke("leave_conversation", { conversationId: id });
-      sys(`left ${state.activeLabel || short(id)}`);
+      sys(`left ${label}`);
       state.active = null;
       state.activeKind = null;
       state.activeLabel = null;
       updateStatusBar();
       clearScreen();
-      showIdle();
+      showIdle("home");
       break;
     }
     case "/file": {
@@ -627,7 +707,62 @@ async function runCommand(raw) {
       break;
     }
     default:
-      sys("unknown command - /help");
+      sys("unknown - /help");
+  }
+}
+
+async function doJoin(code) {
+  if (!isValidJoinCode(code)) {
+    sys("codes start with P- (1:1) or R- (group)");
+    return;
+  }
+  if (isOwnPendingCode(code)) {
+    sys("that's your own code - give it to someone else");
+    return;
+  }
+  let info;
+  try {
+    info = await invoke("inspect_code", { code });
+  } catch (e) {
+    sys(humanError(e));
+    return;
+  }
+  if (info.kind === "room") {
+    sys(
+      info.reachable
+        ? `joining · ${info.members ?? "?"} present`
+        : "joining · host not reached yet"
+    );
+  } else {
+    sys("connecting…");
+  }
+  try {
+    const result = await invoke("join_code", { code });
+    await refreshLists();
+    if (result.kind === "peer") {
+      const p = result.peer;
+      await openConv(
+        p.endpoint_id,
+        "peer",
+        p.label || short(p.endpoint_id),
+        p.path,
+        { force: true }
+      );
+      sys("line live", "ok");
+    } else {
+      const r = result.room;
+      const live = (r.members || []).length > 0;
+      await openConv(
+        r.topic_id,
+        "room",
+        r.label,
+        live ? "LIVE" : "WAITING",
+        { force: true }
+      );
+      sys(live ? "group live" : "waiting for others", "ok");
+    }
+  } catch (e) {
+    sys(humanError(e));
   }
 }
 
@@ -640,7 +775,7 @@ async function tryWipeConfirm(raw) {
   }
   await invoke("wipe_history", { conversationId: state.active });
   state.wipeDeadline = 0;
-  sys("local history cleared (this device only)");
+  sys("local history cleared", "ok");
   return true;
 }
 
@@ -650,6 +785,7 @@ async function onSubmit() {
   if (!raw.trim()) return;
   el.value = "";
   autoSize();
+  updatePlaceholder();
 
   if (raw.trimStart().startsWith("/")) {
     sys(`> ${raw.trim()}`);
@@ -663,13 +799,21 @@ async function onSubmit() {
 
   if (await tryWipeConfirm(raw)) return;
 
+  // Bare P-/R- code in the input = join
+  const maybe = raw.trim();
+  if (isValidJoinCode(maybe) && !state.active) {
+    sys(`> /join ${maybe}`);
+    await doJoin(maybe);
+    return;
+  }
+
   if (!state.active) {
-    sys("no conversation - /connect /join /room /go");
+    sys("no line yet - /connect /join /room");
     return;
   }
   try {
     await invoke("send_text", { conversationId: state.active, body: raw });
-    invoke("send_typing", { conversationId: state.active, active: false });
+    stopTyping();
   } catch (e) {
     sys(humanError(e));
   }
@@ -679,6 +823,31 @@ function autoSize() {
   const el = $("input");
   el.style.height = "auto";
   el.style.height = Math.min(el.scrollHeight, 120) + "px";
+}
+
+function stopTyping() {
+  clearTimeout(state.typingTimer);
+  clearTimeout(state.typingStopTimer);
+  state.typingTimer = null;
+  state.typingStopTimer = null;
+  if (state.active) {
+    invoke("send_typing", { conversationId: state.active, active: false });
+  }
+}
+
+function pulseTyping() {
+  if (!state.active) return;
+  if ($("input").value.startsWith("/")) return;
+  clearTimeout(state.typingTimer);
+  state.typingTimer = setTimeout(() => {
+    invoke("send_typing", { conversationId: state.active, active: true });
+  }, 180);
+  clearTimeout(state.typingStopTimer);
+  state.typingStopTimer = setTimeout(() => {
+    if (state.active) {
+      invoke("send_typing", { conversationId: state.active, active: false });
+    }
+  }, 1600);
 }
 
 function sleep(ms) {
@@ -722,7 +891,7 @@ async function demoConversationHost() {
   sys("> /connect");
   const code = await invoke("start_pairing");
   await refreshLists();
-  sysValue("peer code  ", code);
+  sysValue("code  ", code);
   await invoke("spawn_demo_peer", { code });
   const ok = await waitUntil(async () => {
     await refreshLists();
@@ -791,7 +960,7 @@ async function demoCommandsHost() {
   sys("> /connect");
   const code = await invoke("start_pairing");
   await refreshLists();
-  sysValue("peer code  ", code);
+  sysValue("code  ", code);
   await invoke("spawn_demo_peer", { code });
   const ok = await waitUntil(async () => {
     await refreshLists();
@@ -852,6 +1021,22 @@ function showIdleMarkOnly() {
   log.scrollTop = log.scrollHeight;
 }
 
+function tabComplete() {
+  const el = $("input");
+  const v = el.value;
+  if (!v.startsWith("/") || v.includes(" ")) return false;
+  const matches = COMMANDS.filter((c) => c.startsWith(v.toLowerCase()));
+  if (matches.length === 1) {
+    el.value = matches[0] + (matches[0] === "/join" || matches[0] === "/go" || matches[0] === "/name" || matches[0] === "/hist" || matches[0] === "/file" || matches[0] === "/demo" ? " " : "");
+    return true;
+  }
+  if (matches.length > 1) {
+    sys(matches.join("  "));
+    return true;
+  }
+  return false;
+}
+
 async function playBoot() {
   const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
   const bootEl = $("boot");
@@ -861,18 +1046,18 @@ async function playBoot() {
     if (appEl) appEl.classList.add("ready");
     return;
   }
-  await sleep(1600);
+  await sleep(1180);
   bootEl.classList.add("done");
   appEl.classList.add("ready");
-  await sleep(200);
+  await sleep(160);
 }
 
 async function boot() {
   await playBoot();
-  showIdle();
+  showIdle("home");
   await refreshLists();
+  updatePlaceholder();
 
-  // Soft nudge if GitHub has a newer release (never blocks boot).
   invoke("check_update")
     .then((info) => {
       if (info?.available) {
@@ -884,7 +1069,14 @@ async function boot() {
 
   await listen("message", (ev) => {
     const m = ev.payload;
-    if (m.conversation_id !== state.active) return;
+    if (m.conversation_id !== state.active) {
+      if (!m.outgoing && !state.demoRunning) {
+        const label =
+          peerLabel(m.sender_id) || short(m.conversation_id) || "peer";
+        sys(`· ${label}`, "ok");
+      }
+      return;
+    }
     appendMsg(m.body, m.outgoing ? "out" : "in", false, m);
   });
 
@@ -925,7 +1117,14 @@ async function boot() {
 
   await listen("typing", (ev) => {
     if (ev.payload.conversation_id !== state.active) return;
-    $("typing").textContent = ev.payload.active ? "..." : "";
+    if (!ev.payload.active) {
+      $("typing").textContent = "";
+      return;
+    }
+    const who = isGroupRoom()
+      ? peerLabel(ev.payload.sender || ev.payload.sender_id)
+      : null;
+    $("typing").textContent = who ? `${who} ···` : "···";
   });
 
   await listen("pairing_expired", () => {
@@ -935,8 +1134,15 @@ async function boot() {
 
   await listen("file_progress", (ev) => {
     if (ev.payload.conversation_id !== state.active) return;
-    if (ev.payload.pct >= 100) return;
-    sys(`file ${ev.payload.pct}% · ${ev.payload.phase}`);
+    const pct = ev.payload.pct ?? 0;
+    if (pct >= 100) {
+      clearProgress();
+      return;
+    }
+    const width = 24;
+    const filled = Math.floor((pct * width) / 100);
+    const bar = `[${"█".repeat(filled)}${"░".repeat(width - filled)}] ${pct}%`;
+    sysProgress(`${bar}  ${ev.payload.phase || "file"}`);
   });
 
   await listen("update_progress", (ev) => {
@@ -954,15 +1160,44 @@ async function boot() {
 
   $("input").addEventListener("input", () => {
     autoSize();
-    if (!state.active) return;
-    if ($("input").value.startsWith("/")) return;
-    invoke("send_typing", { conversationId: state.active, active: true });
+    pulseTyping();
   });
 
   $("input").addEventListener("keydown", (e) => {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       onSubmit();
+      return;
+    }
+    if (e.key === "Tab") {
+      if (tabComplete()) e.preventDefault();
+      return;
+    }
+    if (e.key === "Escape") {
+      e.preventDefault();
+      $("input").value = "";
+      autoSize();
+      stopTyping();
+    }
+  });
+
+  $("input").addEventListener("paste", (e) => {
+    const text = (e.clipboardData || window.clipboardData)?.getData("text") || "";
+    const trimmed = text.trim();
+    if (!isValidJoinCode(trimmed)) return;
+    if ($("input").value.trim()) return;
+    e.preventDefault();
+    $("input").value = `/join ${trimmed}`;
+    autoSize();
+  });
+
+  $("short-id").addEventListener("click", async () => {
+    if (!state.myShort) return;
+    try {
+      await navigator.clipboard.writeText(state.myId || state.myShort);
+      sys("id copied", "ok");
+    } catch {
+      /* ignore */
     }
   });
 

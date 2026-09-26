@@ -24,10 +24,17 @@
 
     <main>
       <div id="log" class="log" aria-live="polite"></div>
-      <div id="typing" class="typing dim"></div>
+      <div id="typing" class="typing dim" aria-live="polite"></div>
       <form id="composer">
-        <span class="prompt">&gt;</span>
-        <textarea id="input" rows="1" autocomplete="off" spellcheck="false" placeholder=""></textarea>
+        <span class="prompt" aria-hidden="true">&gt;</span>
+        <textarea
+          id="input"
+          rows="1"
+          autocomplete="off"
+          spellcheck="false"
+          placeholder="/connect  /join  /help"
+          aria-label="message or command"
+        ></textarea>
       </form>
     </main>
   </div>

@@ -1,12 +1,13 @@
 :root {
-  --bg: #050705;
-  --bg-deep: #000000;
-  --fg: #3dff70;
-  --fg-soft: #2acc58;
-  --dim: #1a6b2e;
-  --dimmer: #0d3a18;
-  --warn: #e6a800;
-  --danger: #ff4d3a;
+  --bg: #060806;
+  --bg-deep: #020302;
+  --fg: #7dff9a;
+  --fg-soft: #4fcf6e;
+  --dim: #3d7a4a;
+  --dimmer: #1a3d24;
+  --warn: #d4a017;
+  --danger: #e85a4a;
+  --relay: #8fb89a;
   --s1: 4px;
   --s2: 8px;
   --s3: 16px;
@@ -14,7 +15,7 @@
   --s5: 40px;
   --font: "Cascadia Mono", "JetBrains Mono", "Consolas", "Courier New", monospace;
   --ease: cubic-bezier(0.22, 1, 0.36, 1);
-  --dur: 420ms;
+  --dur: 280ms;
 }
 
 * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -31,16 +32,38 @@ html, body {
 }
 
 ::selection {
-  background: rgba(61, 255, 112, 0.22);
+  background: rgba(125, 255, 154, 0.2);
   color: #fff;
 }
 
 body {
   position: relative;
   background:
-    radial-gradient(ellipse 120% 80% at 50% -20%, rgba(26, 107, 46, 0.18), transparent 55%),
-    radial-gradient(ellipse 80% 60% at 100% 100%, rgba(0, 0, 0, 0.9), transparent 50%),
+    radial-gradient(ellipse 130% 90% at 50% -25%, rgba(61, 122, 74, 0.16), transparent 58%),
+    radial-gradient(ellipse 70% 50% at 50% 110%, rgba(0, 0, 0, 0.85), transparent 55%),
     var(--bg-deep);
+}
+
+/* Soft film grain + vignette — presence, not CRT hacker */
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  pointer-events: none;
+  opacity: 0.045;
+  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+  background-size: 180px 180px;
+  mix-blend-mode: overlay;
+}
+
+body::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: 49;
+  pointer-events: none;
+  background: radial-gradient(ellipse 85% 75% at 50% 45%, transparent 40%, rgba(0, 0, 0, 0.45) 100%);
 }
 
 .app {
@@ -50,8 +73,8 @@ body {
   position: relative;
   z-index: 1;
   opacity: 0;
-  transform: translateY(6px);
-  transition: opacity 700ms var(--ease), transform 700ms var(--ease);
+  transform: translateY(5px);
+  transition: opacity 520ms var(--ease), transform 520ms var(--ease);
 }
 
 .app.ready {
@@ -68,9 +91,9 @@ body {
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  gap: 18px;
+  gap: 16px;
   background: var(--bg-deep);
-  transition: opacity 600ms var(--ease), visibility 600ms;
+  transition: opacity 480ms var(--ease), visibility 480ms;
 }
 
 .boot.done {
@@ -81,29 +104,29 @@ body {
 
 .boot-brand {
   font-size: 22px;
-  letter-spacing: 0.35em;
-  text-indent: 0.35em;
+  letter-spacing: 0.32em;
+  text-indent: 0.32em;
   color: var(--fg);
   opacity: 0;
-  transform: scale(0.98);
-  animation: bootIn 900ms var(--ease) 120ms forwards;
+  transform: scale(0.985);
+  animation: bootIn 720ms var(--ease) 80ms forwards;
 }
 
 .boot-mark {
-  font-size: 13px;
-  letter-spacing: 0.2em;
+  font-size: 12px;
+  letter-spacing: 0.22em;
   color: var(--dim);
   opacity: 0;
-  animation: bootIn 700ms var(--ease) 520ms forwards;
+  animation: bootIn 560ms var(--ease) 380ms forwards;
 }
 
 .boot-bar {
-  width: 72px;
+  width: 64px;
   height: 1px;
   background: var(--dimmer);
   overflow: hidden;
   opacity: 0;
-  animation: bootIn 500ms var(--ease) 380ms forwards;
+  animation: bootIn 400ms var(--ease) 260ms forwards;
 }
 
 .boot-bar > i {
@@ -111,7 +134,7 @@ body {
   height: 100%;
   width: 0;
   background: var(--fg-soft);
-  animation: bootBar 1100ms var(--ease) 480ms forwards;
+  animation: bootBar 900ms var(--ease) 320ms forwards;
 }
 
 @keyframes bootIn {
@@ -142,6 +165,12 @@ body {
 #short-id {
   font-size: 12px;
   letter-spacing: 0.04em;
+  cursor: pointer;
+  transition: color var(--dur) var(--ease);
+}
+
+#short-id:hover {
+  color: var(--fg-soft);
 }
 
 .status-conv {
@@ -151,6 +180,7 @@ body {
   white-space: nowrap;
   font-size: 12px;
   letter-spacing: 0.02em;
+  transition: color var(--dur) var(--ease);
 }
 
 .path-label,
@@ -160,12 +190,25 @@ body {
   font-size: 11px;
   color: var(--dim);
   flex-shrink: 0;
-  transition: color 300ms var(--ease), opacity 300ms var(--ease);
+  transition: color 280ms var(--ease), opacity 280ms var(--ease);
 }
 
 .path-label.live {
   color: var(--fg-soft);
-  animation: pathFlash 700ms var(--ease);
+  animation: pathFlash 560ms var(--ease);
+}
+
+.path-label.relay {
+  color: var(--relay);
+  animation: pathFlash 560ms var(--ease);
+}
+
+.path-label.wait {
+  animation: breathe 2.4s ease-in-out infinite;
+}
+
+.path-label.offline {
+  color: var(--warn);
 }
 
 .code-ttl.warn { color: var(--warn); }
@@ -173,7 +216,7 @@ body {
 
 @keyframes pathFlash {
   0% { opacity: 0.35; }
-  40% { opacity: 1; color: var(--fg); }
+  40% { opacity: 1; }
   100% { opacity: 1; }
 }
 
@@ -182,21 +225,37 @@ main {
   display: flex;
   flex-direction: column;
   min-height: 0;
+  position: relative;
+}
+
+/* Soft fade at top of scroll — depth */
+main::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 18px;
+  z-index: 2;
+  pointer-events: none;
+  background: linear-gradient(to bottom, var(--bg-deep), transparent);
+  opacity: 0.7;
 }
 
 .log {
   flex: 1;
   overflow: auto;
   padding: 10px 22px 16px;
-  line-height: 1.6;
+  line-height: 1.65;
   scrollbar-width: thin;
   scrollbar-color: var(--dimmer) transparent;
 }
 
-.log::-webkit-scrollbar { width: 6px; }
+.log::-webkit-scrollbar { width: 5px; }
 .log::-webkit-scrollbar-track { background: transparent; }
 .log::-webkit-scrollbar-thumb {
   background: var(--dimmer);
+  border-radius: 2px;
 }
 .log::-webkit-scrollbar-thumb:hover {
   background: var(--dim);
@@ -208,12 +267,22 @@ main {
   margin-bottom: 3px;
   color: var(--fg-soft);
   font-weight: 400;
-  animation: lineIn 320ms var(--ease) both;
+  animation: lineIn 240ms var(--ease) both;
+}
+
+.log .line.hist {
+  animation: none;
 }
 
 .log .line.sys {
   color: var(--dim);
   font-size: 13px;
+}
+
+.log .line.sys.progress {
+  animation: none;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.02em;
 }
 
 .log .line.out {
@@ -227,7 +296,13 @@ main {
 .log .line .val {
   font-weight: 700;
   color: var(--fg);
-  animation: valFlash 900ms var(--ease);
+  animation: valFlash 700ms var(--ease);
+  cursor: pointer;
+}
+
+.log .line .val:hover {
+  text-decoration: underline;
+  text-underline-offset: 3px;
 }
 
 .log .line.ok {
@@ -238,10 +313,14 @@ main {
   color: var(--danger);
 }
 
+.log .line.help {
+  color: var(--dim);
+}
+
 @keyframes lineIn {
   from {
     opacity: 0;
-    transform: translateY(4px);
+    transform: translateY(3px);
   }
   to {
     opacity: 1;
@@ -250,35 +329,42 @@ main {
 }
 
 @keyframes valFlash {
-  0% { opacity: 0.4; }
-  35% { opacity: 1; }
+  0% { opacity: 0.45; }
+  40% { opacity: 1; }
   100% { opacity: 1; }
 }
 
 .log .idle-mark {
-  margin: var(--s5) 0 var(--s3);
-  font-size: 32px;
+  margin: var(--s5) 0 var(--s2);
+  font-size: 30px;
   letter-spacing: 0.18em;
   color: var(--dim);
-  animation: breathe 3.2s ease-in-out infinite;
+  animation: breathe 3.4s ease-in-out infinite;
+}
+
+.log .idle-hint {
+  color: var(--dim);
+  font-size: 13px;
+  margin-bottom: 4px;
+  animation: lineIn 360ms var(--ease) both;
 }
 
 @keyframes breathe {
-  0%, 100% { opacity: 0.35; }
-  50% { opacity: 0.85; }
+  0%, 100% { opacity: 0.32; }
+  50% { opacity: 0.78; }
 }
 
 .typing {
   min-height: 1.15em;
   padding: 0 22px 4px;
   font-size: 12px;
-  letter-spacing: 0.12em;
+  letter-spacing: 0.1em;
   color: var(--dim);
-  transition: opacity 200ms var(--ease);
+  transition: opacity 180ms var(--ease);
 }
 
 .typing:not(:empty) {
-  animation: breathe 1.6s ease-in-out infinite;
+  animation: breathe 1.5s ease-in-out infinite;
 }
 
 #composer {
@@ -287,6 +373,23 @@ main {
   align-items: flex-end;
   padding: 10px 22px 18px;
   flex-shrink: 0;
+  position: relative;
+}
+
+#composer::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 22px;
+  right: 22px;
+  height: 1px;
+  background: var(--dimmer);
+  transition: background 220ms var(--ease), box-shadow 220ms var(--ease);
+}
+
+#composer:focus-within::before {
+  background: var(--dim);
+  box-shadow: 0 0 12px rgba(79, 207, 110, 0.12);
 }
 
 .prompt {
@@ -315,6 +418,16 @@ main {
   font-weight: 400;
 }
 
+#input::placeholder {
+  color: var(--dimmer);
+  letter-spacing: 0.02em;
+  transition: opacity 200ms var(--ease);
+}
+
+#input:focus::placeholder {
+  opacity: 0.35;
+}
+
 .dim { color: var(--dim); }
 
 @media (prefers-reduced-motion: reduce) {
@@ -327,4 +440,5 @@ main {
   }
   .app { opacity: 1; transform: none; }
   .boot { display: none; }
+  body::before { opacity: 0.02; }
 }
