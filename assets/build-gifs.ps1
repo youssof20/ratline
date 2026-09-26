@@ -47,13 +47,13 @@ function Write-FrameHtml($demo, $reveal, $path) {
 <style>
 html,body{margin:0;padding:0;background:#000;color:#33ff66;font:14px/1.5 Consolas,monospace;width:720px;height:405px;overflow:hidden}
 .app{height:100%;display:flex;flex-direction:column;box-sizing:border-box;background:#000}
-.status{display:flex;gap:16px;align-items:center;padding:8px 16px;border-bottom:1px solid #1a8833;font-size:13px;min-height:40px;box-sizing:border-box}
+.status{display:flex;gap:16px;align-items:center;padding:8px 16px;font-size:13px;min-height:40px;box-sizing:border-box}
 .brand{letter-spacing:.06em;font-size:15px}.dim{color:#1a8833}.status-conv{flex:1}
 .path{letter-spacing:.04em;text-transform:uppercase;font-size:11px;color:#1a8833}
 .log{flex:1;padding:16px;box-sizing:border-box}
 .line{margin-bottom:4px;white-space:pre-wrap;font-weight:400;color:#33ff66}
 .sys{color:#1a8833;font-size:13px}.val{font-weight:700;color:#33ff66}
-.composer{display:flex;gap:8px;padding:8px 16px;border-top:1px solid #1a8833;box-sizing:border-box}
+.composer{display:flex;gap:8px;padding:8px 16px;box-sizing:border-box}
 .prompt{color:#1a8833}
 </style></head><body>
 <div class="app">
