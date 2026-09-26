@@ -8,6 +8,11 @@ src-tauri/target/
 history.db
 identity.json
 
+# Demo render scratch
+assets/frames-*/
+assets/test-shot*.png
+assets/frame-*.png
+
 # Agent / AI session artifacts — never publish
 AGENTS.md
 CLAUDE.md

@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>ratline demo</title>
+<style>
+  html, body { margin:0; padding:0; background:#000; color:#33ff66; font:14px/1.5 Consolas, monospace; width:720px; height:405px; overflow:hidden; }
+  .app { height:100%; display:flex; flex-direction:column; box-sizing:border-box; background:#000; }
+  .status { display:flex; gap:16px; align-items:center; padding:8px 16px; border-bottom:1px solid #1a8833; font-size:13px; min-height:40px; box-sizing:border-box; }
+  .brand { letter-spacing:0.06em; font-size:15px; }
+  .dim { color:#1a8833; }
+  .status-conv { flex:1; }
+  .path { letter-spacing:0.04em; text-transform:uppercase; font-size:11px; color:#1a8833; }
+  .log { flex:1; padding:16px; box-sizing:border-box; }
+  .line { margin-bottom:4px; white-space:pre-wrap; font-weight:400; color:#33ff66; }
+  .sys { color:#1a8833; font-size:13px; }
+  .val { font-weight:700; color:#33ff66; }
+  .composer { display:flex; gap:8px; padding:8px 16px; border-top:1px solid #1a8833; box-sizing:border-box; }
+  .prompt { color:#1a8833; }
+</style>
+</head>
+<body>
+<div class="app" id="root"></div>
+<script>
+const scenes = {
+  conversation: [
+    {
+      status: { id: "a1b2c3d4", conv: "peer:wire", path: "DIRECT" },
+      lines: [
+        { cls: "sys", html: "peer code  <span class='val'>P-AB12-CD34</span>" },
+        { cls: "sys", text: "expires in 540s" },
+        { cls: "", text: "> line still dark?" },
+        { cls: "", text: "< dark enough" },
+        { cls: "", text: "> relay saw us once" },
+        { cls: "", text: "< then we cut it" },
+        { cls: "", text: "> hold" },
+      ],
+      input: ""
+    }
+  ],
+  commands: [
+    {
+      status: { id: "a1b2c3d4", conv: "peer:a1b2c3d4", path: "DIRECT" },
+      lines: [
+        { cls: "sys", text: "demo · commands" },
+        { cls: "sys", text: "> /connect" },
+        { cls: "sys", html: "peer code  <span class='val'>P-XY98-ZW76</span>" },
+        { cls: "sys", text: "copied" },
+        { cls: "sys", text: "> ping" },
+        { cls: "", text: "> ping" },
+        { cls: "", text: "< pong" },
+        { cls: "sys", text: "> /who" },
+        { cls: "sys", text: "1. [peer] a1b2c3d4  DIRECT  a1b2c3d4" },
+      ],
+      input: ""
+    }
+  ]
+};
+
+const kind = new URLSearchParams(location.search).get("demo") || "conversation";
+const step = Number(new URLSearchParams(location.search).get("step") || "0");
+const sceneList = scenes[kind] || scenes.conversation;
+const scene = sceneList[Math.min(step, sceneList.length - 1)];
+
+function render(s, reveal) {
+  const lines = s.lines.slice(0, reveal);
+  const root = document.getElementById("root");
+  root.innerHTML = `
+    <div class="status">
+      <span class="brand">ratline</span>
+      <span class="dim">${s.status.id}</span>
+      <span class="status-conv dim">${s.status.conv}</span>
+      <span class="path">${s.status.path}</span>
+    </div>
+    <div class="log">${lines.map(l => {
+      if (l.html) return `<div class="line ${l.cls||""}">${l.html}</div>`;
+      return `<div class="line ${l.cls||""}">${escapeHtml(l.text)}</div>`;
+    }).join("")}</div>
+    <div class="composer"><span class="prompt">&gt;</span><span>${escapeHtml(s.input||"")}</span></div>
+  `;
+}
+
+function escapeHtml(t) {
+  return String(t).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+}
+
+const reveal = Number(new URLSearchParams(location.search).get("reveal") || String(scene.lines.length));
+render(scene, reveal);
+document.title = "ready";
+</script>
+</body>
+</html>

@@ -2,9 +2,9 @@
 
 Peer-to-peer encrypted chat. No accounts, no server, no cloud.
 
-![conversation demo](assets/demo-conversation.gif)
+<img src="assets/demo-conversation.gif" width="640" alt="conversation demo" />
 
-![commands demo](assets/demo-commands.gif)
+<img src="assets/demo-commands.gif" width="640" alt="commands demo" />
 
 Both people need to be online at the same time. Nothing is queued for later.
 
@@ -74,6 +74,8 @@ One input line. Lines without `/` are chat messages (Enter sends, Shift+Enter is
 ```
 
 Status bar shows DIRECT or RELAYED.
+
+In 1:1 chats, `>` is you and `<` is them. In rooms with more than two people, lines use `<name>` instead.
 
 ## Privacy
 

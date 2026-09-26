@@ -21,31 +21,15 @@ function short(hex) {
   return (hex || "").slice(0, 8);
 }
 
-function pathClass(path) {
-  const p = (path || "").toUpperCase();
-  if (p === "DIRECT") return "direct";
-  if (p === "RELAYED") return "relayed";
-  if (p === "LIVE" || p === "WAITING") return "live";
-  return "offline";
-}
-
-function setPath(path, pulse) {
-  const prev = state.path;
+function setPath(path) {
   state.path = (path || "-").toUpperCase();
   $("path-label").textContent = state.path;
-  const dot = $("path-dot");
-  dot.className = `dot ${pathClass(state.path)}`;
-  if (pulse && prev !== state.path) {
-    dot.classList.remove("pulse");
-    void dot.offsetWidth;
-    dot.classList.add("pulse");
-  }
 }
 
 function updateStatusBar() {
   if (!state.active) {
     $("status-conv").textContent = "-";
-    setPath("-", false);
+    setPath("-");
     return;
   }
   const tag = state.activeKind === "room" ? "room" : "peer";
@@ -53,12 +37,36 @@ function updateStatusBar() {
   $("status-conv").textContent = `${tag}:${name}`;
 }
 
+function roomMemberCount() {
+  if (state.activeKind !== "room" || !state.active) return 0;
+  const r = state.rooms.find((x) => x.topic_id === state.active);
+  return (r?.members || []).length;
+}
+
+/** True when more than two people are in the active room. */
+function isGroupRoom() {
+  // members[] is everyone else; +1 for self
+  return state.activeKind === "room" && roomMemberCount() + 1 > 2;
+}
+
+function peerLabel(senderId) {
+  if (!senderId) return short(state.active) || "peer";
+  const p = state.peers.find((x) => x.endpoint_id === senderId);
+  if (p?.label) return p.label;
+  const r = state.rooms.find((x) => x.topic_id === state.active);
+  const m = (r?.members || []).find((x) => x === senderId || x?.id === senderId);
+  if (m && typeof m === "object" && m.label) return m.label;
+  return short(senderId);
+}
+
+function clearIdle() {
+  const idle = $("log").querySelector(".idle-mark");
+  if (idle) idle.remove();
+}
+
 function sys(text, cls) {
   const log = $("log");
-  // remove idle mark if present
-  const idle = log.querySelector(".idle-mark");
-  if (idle) idle.remove();
-
+  clearIdle();
   const line = document.createElement("div");
   line.className = `line sys ${cls || ""}`;
   line.textContent = text;
@@ -66,21 +74,25 @@ function sys(text, cls) {
   log.scrollTop = log.scrollHeight;
 }
 
-function helpLine(html) {
+/** System line with a copyable value in bold. */
+function sysValue(prefix, value, suffix) {
   const log = $("log");
-  const idle = log.querySelector(".idle-mark");
-  if (idle) idle.remove();
+  clearIdle();
   const line = document.createElement("div");
-  line.className = "line help";
-  line.innerHTML = html;
+  line.className = "line sys";
+  line.appendChild(document.createTextNode(prefix));
+  const val = document.createElement("span");
+  val.className = "val";
+  val.textContent = value;
+  line.appendChild(val);
+  if (suffix) line.appendChild(document.createTextNode(suffix));
   log.appendChild(line);
   log.scrollTop = log.scrollHeight;
 }
 
-function appendMsg(body, cls, typewriter, meta) {
+function appendMsg(body, cls, _unused, meta) {
   const log = $("log");
-  const idle = log.querySelector(".idle-mark");
-  if (idle) idle.remove();
+  clearIdle();
 
   const line = document.createElement("div");
   line.className = `line ${cls}`;
@@ -107,34 +119,16 @@ function appendMsg(body, cls, typewriter, meta) {
     };
   }
 
-  const paint = (n) => {
-    line.textContent = "";
-    const who = document.createElement("span");
-    who.className = "who";
-    who.textContent = cls === "out" ? "you> " : `${short(meta?.sender_id)}> `;
-    line.appendChild(who);
-    line.appendChild(document.createTextNode(body.slice(0, n)));
-  };
-
-  if (!typewriter) {
-    paint(body.length);
-    log.scrollTop = log.scrollHeight;
-    return;
+  let prefix;
+  if (isGroupRoom()) {
+    const shown = cls === "out" ? "me" : peerLabel(meta?.sender_id);
+    prefix = `<${shown}> `;
+  } else {
+    prefix = cls === "out" ? "> " : "< ";
   }
 
-  let i = 0;
-  const cursor = document.createElement("span");
-  cursor.className = "tw-cursor";
-  const tick = () => {
-    paint(i);
-    if (i < body.length) {
-      line.appendChild(cursor);
-      i++;
-      log.scrollTop = log.scrollHeight;
-      setTimeout(tick, 6 + Math.random() * 10);
-    }
-  };
-  tick();
+  line.textContent = prefix + body;
+  log.scrollTop = log.scrollHeight;
 }
 
 function showIdle() {
@@ -143,7 +137,7 @@ function showIdle() {
   if (log.children.length > 0) return;
   const mark = document.createElement("div");
   mark.className = "idle-mark";
-  mark.innerHTML = '&lt;?&gt;<span class="block-cursor"></span>';
+  mark.textContent = "<?>";
   log.appendChild(mark);
   sys("type /help");
 }
@@ -158,13 +152,13 @@ async function refreshLists() {
     const p = state.peers.find((x) => x.endpoint_id === state.active);
     if (p) {
       state.activeLabel = p.label || short(p.endpoint_id);
-      setPath(p.connected ? p.path : "OFFLINE", true);
+      setPath(p.connected ? p.path : "OFFLINE");
     }
   } else if (state.active && state.activeKind === "room") {
     const r = state.rooms.find((x) => x.topic_id === state.active);
     if (r) {
       state.activeLabel = r.label || short(r.topic_id);
-      setPath((r.members || []).length ? "LIVE" : "WAITING", true);
+      setPath((r.members || []).length ? "LIVE" : "WAITING");
     }
   }
   updateStatusBar();
@@ -182,7 +176,7 @@ function trackCodeExpiry(code, kind, secs) {
   clearInterval(state.codeTimer);
   let left = secs;
   const kindLabel = kind === "room" ? "room" : "peer";
-  sys(`${kindLabel} code  ${code}`);
+  sysValue(`${kindLabel} code  `, code);
   if (kind === "room") {
     sys("reusable while this room is open");
     return;
@@ -209,7 +203,7 @@ async function openConv(id, kind, label, path) {
   state.active = id;
   state.activeKind = kind;
   state.activeLabel = label || short(id);
-  setPath(path || "-", true);
+  setPath(path || "-");
   updateStatusBar();
   sys(`${kind} ${state.activeLabel}`);
   try {
@@ -271,7 +265,7 @@ async function runCommand(raw) {
   switch (cmd) {
     case "/help":
     case "/?": {
-      helpLine('<span class="glyph">&lt;?&gt;</span>');
+      sys("<?>");
       sys("/connect              peer code (1:1, single-use)");
       sys("/room                 room code (reusable while open)");
       sys("/join <code>          peer or room");
@@ -449,7 +443,7 @@ async function runCommand(raw) {
       state.activeKind = null;
       state.activeLabel = null;
       updateStatusBar();
-      setPath("-", false);
+      setPath("-");
       break;
     }
     case "/file": {
@@ -674,7 +668,7 @@ function showIdleMarkOnly() {
   const log = $("log");
   const mark = document.createElement("div");
   mark.className = "idle-mark";
-  mark.innerHTML = '&lt;?&gt;<span class="block-cursor"></span>';
+  mark.textContent = "<?>";
   log.appendChild(mark);
   log.scrollTop = log.scrollHeight;
 }
@@ -686,7 +680,7 @@ async function boot() {
   await listen("message", (ev) => {
     const m = ev.payload;
     if (m.conversation_id !== state.active) return;
-    appendMsg(m.body, m.outgoing ? "out" : "in", !m.outgoing, m);
+    appendMsg(m.body, m.outgoing ? "out" : "in", false, m);
   });
 
   await listen("peer_update", () => refreshLists());
@@ -708,7 +702,7 @@ async function boot() {
 
   await listen("conn_path", (ev) => {
     if (ev.payload.conversation_id === state.active) {
-      setPath(ev.payload.path, true);
+      setPath(ev.payload.path);
     }
     refreshLists();
   });

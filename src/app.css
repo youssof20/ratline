@@ -4,7 +4,6 @@
   --dim: #1a8833;
   --warn: #ffb000;
   --danger: #ff5533;
-  --in: #7dff9a;
   --s1: 4px;
   --s2: 8px;
   --s3: 16px;
@@ -25,28 +24,10 @@ html, body {
 
 body { position: relative; }
 
-.crt {
-  position: relative;
-  z-index: 1;
+.app {
   height: 100%;
   display: flex;
   flex-direction: column;
-  text-shadow: 0 0 4px rgba(51, 255, 102, 0.35);
-}
-
-.scanlines {
-  pointer-events: none;
-  position: fixed;
-  inset: 0;
-  z-index: 2;
-  background: repeating-linear-gradient(
-    to bottom,
-    transparent 0,
-    transparent 2px,
-    rgba(0, 0, 0, 0.12) 2px,
-    rgba(0, 0, 0, 0.12) 4px
-  );
-  mix-blend-mode: multiply;
 }
 
 .status {
@@ -60,8 +41,7 @@ body { position: relative; }
 }
 
 .brand {
-  font-weight: 700;
-  letter-spacing: 0.1em;
+  letter-spacing: 0.06em;
   font-size: 15px;
 }
 
@@ -72,34 +52,11 @@ body { position: relative; }
   white-space: nowrap;
 }
 
-.path-badge {
-  display: inline-flex;
-  align-items: center;
-  gap: var(--s1);
-  letter-spacing: 0.06em;
+.path-label {
+  letter-spacing: 0.04em;
   text-transform: uppercase;
   font-size: 11px;
   color: var(--dim);
-}
-
-.dot {
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  background: #444;
-  display: inline-block;
-  flex-shrink: 0;
-}
-.dot.direct { background: var(--fg); box-shadow: 0 0 6px var(--fg); }
-.dot.relayed { background: var(--warn); box-shadow: 0 0 6px var(--warn); }
-.dot.live { background: var(--fg); }
-.dot.offline { background: #444; }
-.dot.pulse { animation: pulse 0.45s ease-out; }
-
-@keyframes pulse {
-  0% { transform: scale(1); }
-  40% { transform: scale(1.8); opacity: 0.4; }
-  100% { transform: scale(1); }
 }
 
 main {
@@ -120,44 +77,23 @@ main {
   white-space: pre-wrap;
   word-break: break-word;
   margin-bottom: var(--s1);
+  color: var(--fg);
+  font-weight: 400;
 }
 
-.log .line.out { color: var(--fg); }
-.log .line.out .who { color: var(--dim); }
-.log .line.in { color: var(--in); padding-left: var(--s2); }
-.log .line.in .who { color: var(--dim); }
 .log .line.sys { color: var(--dim); font-size: 13px; }
 .log .line.help { color: var(--fg); }
-.log .line.help .glyph { color: var(--warn); }
 
-.log .line .tw-cursor {
-  display: inline-block;
-  width: 0.55em;
-  height: 1em;
-  background: var(--fg);
-  vertical-align: text-bottom;
-  animation: blink 1s step-end infinite;
+.log .line .val {
+  font-weight: 700;
+  color: var(--fg);
 }
 
 .log .idle-mark {
   margin: var(--s4) 0;
-  font-size: 36px;
-  letter-spacing: 0.12em;
-  display: flex;
-  align-items: center;
+  font-size: 28px;
+  letter-spacing: 0.08em;
   color: var(--dim);
-}
-.log .idle-mark .block-cursor {
-  display: inline-block;
-  width: 0.55em;
-  height: 1em;
-  margin-left: 2px;
-  background: var(--fg);
-  animation: blink 1s step-end infinite;
-}
-
-@keyframes blink {
-  50% { opacity: 0; }
 }
 
 .typing {
@@ -192,6 +128,7 @@ main {
   resize: none;
   max-height: 120px;
   line-height: 1.4;
+  font-weight: 400;
 }
 
 .dim { color: var(--dim); }
