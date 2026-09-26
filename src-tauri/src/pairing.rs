@@ -91,7 +91,7 @@ pub fn open_payload(session_key: &[u8; 32], ciphertext: &[u8]) -> Result<Identit
     let nonce = Nonce::from_slice(&[0u8; 12]);
     let plaintext = cipher
         .decrypt(nonce, ciphertext)
-        .map_err(|_| anyhow!("decrypt failed — wrong code or tampered payload"))?;
+        .map_err(|_| anyhow!("decrypt failed - wrong code or tampered payload"))?;
     serde_json::from_slice(&plaintext).context("payload json")
 }
 

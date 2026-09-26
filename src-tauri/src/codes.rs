@@ -6,7 +6,7 @@ use iroh::SecretKey;
 use rand::RngCore;
 use serde::Serialize;
 
-/// Crockford alphabet (no I, L, O, U) — easier to read aloud.
+/// Crockford alphabet (no I, L, O, U) - easier to read aloud.
 const CROCKFORD: &[u8] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
 const CODE_BYTES: usize = 5; // ~8 crockford chars

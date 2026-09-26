@@ -2,29 +2,29 @@
 
 Peer-to-peer encrypted chat. No accounts, no server, no cloud.
 
-https://github.com/youssof20/ratline/raw/main/assets/demo-conversation.mp4
+![conversation demo](assets/demo-conversation.gif)
 
-https://github.com/youssof20/ratline/raw/main/assets/demo-commands.mp4
+![commands demo](assets/demo-commands.gif)
 
-Both sides must be online at the same time. This is a live line, not an inbox.
+Both people need to be online at the same time. Nothing is queued for later.
 
-## Why
+## Facts
 
 - No phone number, email, or account. Identity is a local keypair.
-- No application server. Nothing to subpoena, because nothing is collected.
-- Fully auditable: client and protocol stack are open source end to end.
+- No app server. Nothing is collected on our side.
+- Source is open. Read it yourself.
 
-Not a Signal or Telegram replacement. Those store and forward. Ratline does not.
+Not Signal or Telegram. Those keep messages on servers. This one does not.
 
 ## Download
 
-Get the latest build from [Releases](https://github.com/youssof20/ratline/releases):
+[Releases](https://github.com/youssof20/ratline/releases)
 
-- Windows: `Ratline_*_x64-setup.exe` (or `.msi`)
+- Windows: `Ratline_*_x64-setup.exe` or `.msi`
 - macOS: `.dmg`
-- Linux: `.AppImage` / `.deb`
+- Linux: `.AppImage` or `.deb`
 
-SHA-256 checksums ship with each release (`SHA256SUMS`).
+Checksums: `SHA256SUMS` in each release.
 
 ## Build from source
 
@@ -35,20 +35,20 @@ npm install
 npm run build
 ```
 
-Needs Rust stable, a C/C++ toolchain, Node.js, and WebView2 on Windows.
+Needs Rust, a C/C++ toolchain, Node.js, and WebView2 on Windows.
 
 ```bash
 npm run dev
 ```
 
-Demo mode (two real local peers, for recording):
+Two-peer demo (for recordings):
 
 ```bash
 ratline --demo conversation
 ratline --demo commands
 ```
 
-Or inside the app: `/demo 1` / `/demo 2`.
+Or in the app: `/demo 1` / `/demo 2`.
 
 ```bash
 ratline --version
@@ -56,32 +56,32 @@ ratline --version
 
 ## Usage
 
-One input line. Text without `/` is a message (Enter sends, Shift+Enter newline).
+One input line. Lines without `/` are chat messages (Enter sends, Shift+Enter is a newline).
 
 ```
-/connect              peer code (1:1, single-use, ~10 min)
-/room                 room code (reusable while open)
-/join <code>          peer (P-…) or room (R-…)
+/connect              peer code (1:1, one use, ~10 min)
+/room                 room code (reuse while open)
+/join <code>          peer (P-...) or room (R-...)
 /who                  connections + DIRECT/RELAYED
 /go <n|name>          switch conversation
-/name <name>          local label only
+/name <name>          local label
 /hist on|off          local encrypted history
 /wipe                 then /wipe confirm within 10s (this device only)
 /leave                leave current (keeps history)
 /file [path]          send a file
-/demo [1|2]           scripted recording run
+/demo [1|2]           scripted demo
 /help  /?             commands
 ```
 
-Connection path shows as DIRECT or RELAYED in the status bar.
+Status bar shows DIRECT or RELAYED.
 
 ## Privacy
 
-- Direct links expose your IP to the peer. Not an anonymity tool.
-- If NAT blocks a direct path, traffic falls back to a public relay. Relays see connection metadata, not message content.
-- History, when enabled, stays on your machine and is encrypted at rest.
+- Direct links show your IP to the peer.
+- If NAT blocks a direct path, traffic can go through a public relay. Relays see connection metadata, not message content.
+- History (if on) stays on your machine, encrypted at rest.
 
-Built on [iroh](https://github.com/n0-computer/iroh) and [Tauri](https://tauri.app).
+Uses [iroh](https://github.com/n0-computer/iroh) and [Tauri](https://tauri.app).
 
 ## License
 

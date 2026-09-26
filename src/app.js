@@ -7,7 +7,7 @@ const state = {
   activeLabel: null,
   peers: [],
   rooms: [],
-  path: "—",
+  path: "-",
   wipeDeadline: 0,
   codeTimer: null,
   lastCode: null,
@@ -31,7 +31,7 @@ function pathClass(path) {
 
 function setPath(path, pulse) {
   const prev = state.path;
-  state.path = (path || "—").toUpperCase();
+  state.path = (path || "-").toUpperCase();
   $("path-label").textContent = state.path;
   const dot = $("path-dot");
   dot.className = `dot ${pathClass(state.path)}`;
@@ -44,8 +44,8 @@ function setPath(path, pulse) {
 
 function updateStatusBar() {
   if (!state.active) {
-    $("status-conv").textContent = "—";
-    setPath("—", false);
+    $("status-conv").textContent = "-";
+    setPath("-", false);
     return;
   }
   const tag = state.activeKind === "room" ? "room" : "peer";
@@ -209,9 +209,9 @@ async function openConv(id, kind, label, path) {
   state.active = id;
   state.activeKind = kind;
   state.activeLabel = label || short(id);
-  setPath(path || "—", true);
+  setPath(path || "-", true);
   updateStatusBar();
-  sys(`— ${kind} ${state.activeLabel} —`);
+  sys(`${kind} ${state.activeLabel}`);
   try {
     const hist = await invoke("get_history", { conversationId: id });
     for (const m of hist) {
@@ -334,8 +334,8 @@ async function runCommand(raw) {
       if (info.kind === "room") {
         sys(
           info.reachable
-            ? `joining room — ${info.members ?? "?"} present`
-            : "joining room — host not reached yet"
+            ? `joining room - ${info.members ?? "?"} present`
+            : "joining room - host not reached yet"
         );
       } else {
         sys("connecting to peer");
@@ -380,7 +380,7 @@ async function runCommand(raw) {
       }
       const t = resolveTarget(args[0]);
       if (!t) {
-        sys("not found — /who");
+        sys("not found - /who");
         break;
       }
       await openConv(t.id, t.kind, t.label, t.path);
@@ -405,15 +405,15 @@ async function runCommand(raw) {
       const mode = (args[0] || "").toLowerCase();
       if (mode !== "on" && mode !== "off") {
         const s = await invoke("get_status");
-        sys(`history: ${s.history_enabled ? "on" : "off"} — saved locally, encrypted.`);
+        sys(`history: ${s.history_enabled ? "on" : "off"} - saved locally, encrypted.`);
         break;
       }
       const on = mode === "on";
       await invoke("set_history", { enabled: on });
       sys(
         on
-          ? "history: on — saved locally, encrypted."
-          : "history: off — new messages not kept."
+          ? "history: on - saved locally, encrypted."
+          : "history: off - new messages not kept."
       );
       break;
     }
@@ -424,7 +424,7 @@ async function runCommand(raw) {
       }
       if (args[0] === "confirm") {
         if (Date.now() > state.wipeDeadline) {
-          sys("wipe expired — /wipe again");
+          sys("wipe expired - /wipe again");
           break;
         }
         await invoke("wipe_history", { conversationId: state.active });
@@ -433,7 +433,7 @@ async function runCommand(raw) {
         break;
       }
       state.wipeDeadline = Date.now() + 10000;
-      sys("clears local copy only — peers keep theirs");
+      sys("clears local copy only - peers keep theirs");
       sys("confirm: /wipe confirm  (10s)");
       break;
     }
@@ -449,7 +449,7 @@ async function runCommand(raw) {
       state.activeKind = null;
       state.activeLabel = null;
       updateStatusBar();
-      setPath("—", false);
+      setPath("-", false);
       break;
     }
     case "/file": {
@@ -473,7 +473,7 @@ async function runCommand(raw) {
       break;
     }
     default:
-      sys(`unknown command — /help`);
+      sys(`unknown command - /help`);
   }
 }
 
@@ -495,7 +495,7 @@ async function onSubmit() {
   }
 
   if (!state.active) {
-    sys("no conversation — /connect /join /room /go");
+    sys("no conversation - /connect /join /room /go");
     return;
   }
   try {
@@ -525,7 +525,7 @@ async function waitUntil(pred, timeoutMs = 45000) {
   return false;
 }
 
-/** Original demo dialogue — terse, not film quotes. */
+/** Demo conversation lines. */
 const DEMO_LINES = [
   { from: "host", text: "line still dark?" },
   { from: "peer", text: "dark enough" },
@@ -702,7 +702,7 @@ async function boot() {
       ev.payload.endpoint_id,
       "peer",
       ev.payload.label || short(ev.payload.endpoint_id),
-      ev.payload.path || "…"
+      ev.payload.path || "..."
     );
   });
 
@@ -715,7 +715,7 @@ async function boot() {
 
   await listen("typing", (ev) => {
     if (ev.payload.conversation_id !== state.active) return;
-    $("typing").textContent = ev.payload.active ? "…" : "";
+    $("typing").textContent = ev.payload.active ? "..." : "";
   });
 
   await listen("pairing_expired", () => {

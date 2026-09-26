@@ -365,7 +365,7 @@ impl App {
                 )
                 .await?;
                 if topic.is_some() {
-                    bail!("peer code returned a room topic — use an R- code for rooms");
+                    bail!("peer code returned a room topic - use an R- code for rooms");
                 }
                 Ok(serde_json::json!({ "kind": "peer", "peer": peer }))
             }
@@ -944,7 +944,7 @@ fn parse_endpoint_id(hex_str: &str) -> Result<EndpointId> {
 fn classify_remote_info_opt(info: Option<&RemoteInfo>) -> String {
     match info {
         Some(i) => classify_remote_info(i),
-        None => "…".into(),
+        None => "...".into(),
     }
 }
 
@@ -1262,7 +1262,7 @@ async fn run_pairing_host(
                 match pair_as_host(conn, &password, &my_payload).await {
                     Ok(their) => {
                         if their.endpoint_id.iter().all(|&b| b == 0) {
-                            // inspect probe — ignore
+                            // inspect probe - ignore
                             continue;
                         }
                         let their_hex = hex::encode(their.endpoint_id);
@@ -1278,7 +1278,7 @@ async fn run_pairing_host(
                             endpoint_id: their_hex.clone(),
                             label: their.label,
                             connected: false,
-                            path: "…".into(),
+                            path: "...".into(),
                         });
                         let _ = app.connect_peer(&their_hex).await;
                         if single_use {
@@ -1375,7 +1375,7 @@ async fn run_pairing_join(
             endpoint_id: their_hex,
             label: their.label,
             connected: true,
-            path: "…".into(),
+            path: "...".into(),
         },
         topic,
     ))
