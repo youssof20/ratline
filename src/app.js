@@ -1,5 +1,6 @@
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
+const { getCurrentWebviewWindow } = window.__TAURI__.webviewWindow;
 
 const COMMANDS = [
   "/help",
@@ -10,10 +11,17 @@ const COMMANDS = [
   "/who",
   "/clear",
   "/wipe",
+  "/burn",
   "/name",
   "/hist",
   "/leave",
   "/file",
+  "/seal",
+  "/drop",
+  "/fp",
+  "/fingerprint",
+  "/sound",
+  "/hotkey",
   "/update",
   "/version",
   "/demo",
@@ -27,12 +35,17 @@ const state = {
   rooms: [],
   path: "",
   wipeDeadline: 0,
+  burnDeadline: 0,
   codeTimer: null,
   lastCode: null,
   pendingCode: null,
+  pendingJoin: null,
   lastCopiedCode: null,
   myShort: "",
   myId: "",
+  fingerprint: "",
+  sound: false,
+  hotkey: "",
   lastSys: "",
   lastSysAt: 0,
   index: [],
@@ -40,12 +53,25 @@ const state = {
   typingTimer: null,
   typingStopTimer: null,
   lastPeerOnline: {},
+  cmdHistory: [],
+  cmdHistIdx: -1,
+  draftInput: "",
 };
 
 const $ = (id) => document.getElementById(id);
 
+const reduceMotion = () =>
+  window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
 function short(hex) {
   return (hex || "").slice(0, 8);
+}
+
+function baseName(path) {
+  return String(path || "")
+    .replace(/\\/g, "/")
+    .split("/")
+    .pop();
 }
 
 function humanError(err) {
@@ -67,6 +93,71 @@ function humanError(err) {
     return line.slice(0, 117) + "...";
   }
   return line;
+}
+
+function levenshtein(a, b) {
+  const m = a.length;
+  const n = b.length;
+  const dp = Array.from({ length: m + 1 }, () => new Array(n + 1).fill(0));
+  for (let i = 0; i <= m; i++) dp[i][0] = i;
+  for (let j = 0; j <= n; j++) dp[0][j] = j;
+  for (let i = 1; i <= m; i++) {
+    for (let j = 1; j <= n; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      dp[i][j] = Math.min(
+        dp[i - 1][j] + 1,
+        dp[i][j - 1] + 1,
+        dp[i - 1][j - 1] + cost
+      );
+    }
+  }
+  return dp[m][n];
+}
+
+function suggestCommand(cmd) {
+  const raw = cmd.toLowerCase();
+  let best = null;
+  let bestD = Infinity;
+  for (const c of COMMANDS) {
+    const d = levenshtein(raw, c);
+    if (d < bestD) {
+      bestD = d;
+      best = c;
+    }
+  }
+  if (best && bestD > 0 && bestD <= 3) return best;
+  return null;
+}
+
+let audioCtx = null;
+
+function ensureAudio() {
+  if (!audioCtx) {
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (Ctx) audioCtx = new Ctx();
+  }
+  return audioCtx;
+}
+
+function blip(kind) {
+  if (!state.sound) return;
+  try {
+    const ctx = ensureAudio();
+    if (!ctx) return;
+    if (ctx.state === "suspended") void ctx.resume();
+    const o = ctx.createOscillator();
+    const g = ctx.createGain();
+    o.type = "sine";
+    o.connect(g);
+    g.connect(ctx.destination);
+    o.frequency.value = kind === "connect" ? 784 : 588;
+    g.gain.setValueAtTime(0.035, ctx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 0.1);
+    o.start(ctx.currentTime);
+    o.stop(ctx.currentTime + 0.1);
+  } catch {
+    /* ignore */
+  }
 }
 
 function setCodeTtl(text, cls) {
@@ -137,6 +228,10 @@ function updateStatusBar() {
 function updatePlaceholder() {
   const el = $("input");
   if (!el) return;
+  if (state.pendingJoin) {
+    el.placeholder = "y / n";
+    return;
+  }
   if (state.active) {
     el.placeholder = "message";
   } else {
@@ -188,7 +283,12 @@ function sys(text, cls) {
   let kind = cls || "";
   if (!kind && /own code|could not|unknown|not found|too slow|expired|offline/i.test(t)) {
     kind = "err";
-  } else if (!kind && /copied|connected|direct|joined|named |history on|erased|line live|group live|up to date/i.test(t)) {
+  } else if (
+    !kind &&
+    /copied|connected|direct|joined|named |history on|erased|line live|group live|up to date|sealed envelope|sound |hotkey /i.test(
+      t
+    )
+  ) {
     kind = "ok";
   }
   line.className = `line sys ${kind}`.trim();
@@ -197,7 +297,7 @@ function sys(text, cls) {
   log.scrollTop = log.scrollHeight;
 }
 
-function sysValue(prefix, value, suffix) {
+function sysValue(prefix, value, suffix, copyHint) {
   const log = $("log");
   clearIdle();
   const line = document.createElement("div");
@@ -206,7 +306,7 @@ function sysValue(prefix, value, suffix) {
   const val = document.createElement("span");
   val.className = "val";
   val.textContent = value;
-  val.title = "click to copy";
+  val.title = copyHint || "click to copy";
   val.onclick = async (e) => {
     e.stopPropagation();
     try {
@@ -241,6 +341,14 @@ function clearProgress() {
   if (line) line.remove();
 }
 
+function msgPrefix(cls, meta) {
+  if (isGroupRoom()) {
+    const shown = cls === "out" ? "me" : peerLabel(meta?.sender_id);
+    return `<${shown}> `;
+  }
+  return cls === "out" ? "> " : "< ";
+}
+
 function appendMsg(body, cls, opts = {}, meta) {
   if (!opts || typeof opts !== "object") opts = {};
   const log = $("log");
@@ -271,16 +379,54 @@ function appendMsg(body, cls, opts = {}, meta) {
     };
   }
 
-  let prefix;
-  if (isGroupRoom()) {
-    const shown = cls === "out" ? "me" : peerLabel(meta?.sender_id);
-    prefix = `<${shown}> `;
-  } else {
-    prefix = cls === "out" ? "> " : "< ";
+  line.textContent = msgPrefix(cls, meta) + body;
+  log.scrollTop = log.scrollHeight;
+}
+
+async function appendMsgLive(body, cls, meta) {
+  const log = $("log");
+  clearIdle();
+  const line = document.createElement("div");
+  line.className = `line ${cls}`;
+  log.appendChild(line);
+
+  if (meta?.kind === "file") {
+    line.style.cursor = "pointer";
+    line.title = "click to save";
+    line.onclick = async () => {
+      const m = body.match(/FILE (.+) \((\d+)b\) (.+)$/);
+      if (!m) return;
+      const dest = await invoke("pick_save", { defaultName: m[1] });
+      if (!dest) return;
+      try {
+        await invoke("download_file", {
+          fromEndpoint: meta.sender_id,
+          hash: m[3],
+          dest,
+        });
+        sys(`saved ${m[1]}`, "ok");
+      } catch (e) {
+        sys(humanError(e));
+      }
+    };
   }
 
-  line.textContent = prefix + body;
-  log.scrollTop = log.scrollHeight;
+  const prefix = msgPrefix(cls, meta);
+  if (reduceMotion() || meta?.kind === "file") {
+    line.textContent = prefix + body;
+    log.scrollTop = log.scrollHeight;
+    return;
+  }
+
+  let shown = prefix;
+  line.textContent = shown;
+  for (let i = 0; i < body.length; i++) {
+    shown += body[i];
+    line.textContent = shown;
+    log.scrollTop = log.scrollHeight;
+    const delay = 18 + Math.floor(Math.random() * 52);
+    await sleep(delay);
+  }
 }
 
 function showIdle(mode = "home") {
@@ -319,14 +465,23 @@ async function refreshLists() {
   const status = await invoke("get_status");
   state.myId = status.endpoint_id || "";
   state.myShort = status.short_id || "";
+  state.fingerprint = status.fingerprint || "";
+  state.sound = !!status.sound;
+  state.hotkey = status.hotkey || "";
   $("short-id").textContent = state.myShort || "····";
+  const fpEl = $("fingerprint");
+  if (fpEl) {
+    fpEl.textContent = state.fingerprint || "····";
+    fpEl.title = state.fingerprint
+      ? "fingerprint — verify out of band · click to copy"
+      : "fingerprint";
+  }
   state.pendingCode = status.pairing_code || null;
 
   const prevPeers = state.peers;
   state.peers = await invoke("list_peers");
   state.rooms = await invoke("list_rooms");
 
-  // Soft disconnect notice for active dm
   if (state.active && state.activeKind === "peer") {
     const p = state.peers.find((x) => x.endpoint_id === state.active);
     const was = prevPeers.find((x) => x.endpoint_id === state.active);
@@ -335,12 +490,8 @@ async function refreshLists() {
       $("typing").textContent = "";
     } else if (p && was && !was.connected && p.connected) {
       sys("line live", "ok");
-    }
-  }
-
-  if (state.active && state.activeKind === "peer") {
-    const p = state.peers.find((x) => x.endpoint_id === state.active);
-    if (p) {
+      blip("connect");
+    } else if (p) {
       state.activeLabel = p.label || short(p.endpoint_id);
       setPath(p.connected ? (p.path || "").toUpperCase() : "OFFLINE");
     }
@@ -386,8 +537,7 @@ function trackCodeExpiry(code, kind, secs) {
     else if (left <= 180) cls = "warn";
     const m = Math.floor(left / 60);
     const s = left % 60;
-    const label =
-      m > 0 ? `${m}:${String(s).padStart(2, "0")}` : `${left}s`;
+    const label = m > 0 ? `${m}:${String(s).padStart(2, "0")}` : `${left}s`;
     setCodeTtl(label, cls);
     left -= 1;
   };
@@ -507,9 +657,35 @@ function normalizeCommand(cmd) {
     "/w": "/who",
     "/u": "/update",
     "/v": "/version",
+    "/f": "/fp",
+    "/b": "/burn",
+    "/s": "/sound",
     "/?": "/help",
   };
   return map[cmd] || cmd;
+}
+
+function pushCmdHistory(line) {
+  const t = line.trim();
+  if (!t.startsWith("/")) return;
+  if (state.cmdHistory[state.cmdHistory.length - 1] === t) return;
+  state.cmdHistory.push(t);
+  if (state.cmdHistory.length > 200) state.cmdHistory.shift();
+  state.cmdHistIdx = -1;
+  state.draftInput = "";
+}
+
+function parseSealArgs(line) {
+  const m = line.match(/^\/seal\s+(\S+)\s+(.*)$/i);
+  if (!m) return null;
+  const peer = m[1];
+  let rest = m[2].trim();
+  if (!rest) return { peer, kind: null };
+  const atMatch = rest.match(/^@\s*(.+)$/);
+  if (atMatch) {
+    return { peer, kind: "file", path: atMatch[1].trim() };
+  }
+  return { peer, kind: "text", body: rest };
 }
 
 async function runCommand(raw) {
@@ -523,22 +699,27 @@ async function runCommand(raw) {
     case "/help": {
       if (args[0] === "more" || args[0] === "all") {
         sys("<?>", "help");
-        sys("/name <name>  local label for current chat");
-        sys("/hist on|off  local encrypted history");
-        sys("/wipe  erase saved history here (confirm in 10s)");
+        sys("/connect  P- pairing  ·  /connect <name>  reconnect known");
+        sys("/room  R- group code");
+        sys("/join <code>");
+        sys("/go <n|name>  ·  /who  list");
+        sys("/clear  screen  ·  /wipe  local history (10s confirm)");
+        sys("/burn  wipe identity + exit (15s confirm)");
+        sys("/name <label>  ·  /hist on|off");
         sys("/leave  disconnect current");
-        sys("/file [path]  send a file");
-        sys("/update  install latest from GitHub");
-        sys("/version  show build");
-        sys("/demo [1|2]  scripted recording run");
+        sys("/file [path]  send in chat");
+        sys("/seal <peer> <msg>  ·  /seal <peer> @ <file>  handoff envelope");
+        sys("/drop <path>  open sealed file for you");
+        sys("/fp [peer]  fingerprint  ·  verify out of band");
+        sys("/sound on|off  ·  /hotkey [chord]");
+        sys("/update  ·  /version");
+        sys("/demo [1|2]  scripted run");
         break;
       }
       sys("<?>", "help");
-      sys("/connect  P- code for 1:1  ·  they /join it");
-      sys("/room  R- code for a group");
-      sys("/join <code>  enter theirs");
-      sys("/go <n|name>  switch  ·  /who  list  ·  /clear");
-      sys("/help more");
+      sys("/connect  P- code  ·  /connect <name>  known peer");
+      sys("/room  R- group  ·  /join <code>");
+      sys("/go · /who · /clear  ·  /help more");
       break;
     }
     case "/version": {
@@ -579,14 +760,28 @@ async function runCommand(raw) {
       break;
     }
     case "/connect": {
-      if (args.length > 0) {
-        sys("/connect takes no arguments");
+      if (!rest) {
+        const code = await invoke("start_pairing");
+        await refreshLists();
+        sysValue("code  ", code);
+        await copyCode(code);
         break;
       }
-      const code = await invoke("start_pairing");
-      await refreshLists();
-      sysValue("code  ", code);
-      await copyCode(code);
+      try {
+        const p = await invoke("connect_named", { name: rest });
+        await refreshLists();
+        await openConv(
+          p.endpoint_id,
+          "peer",
+          p.label || short(p.endpoint_id),
+          p.path,
+          { force: true }
+        );
+        sys("line live", "ok");
+        blip("connect");
+      } catch (e) {
+        sys(humanError(e));
+      }
       break;
     }
     case "/room": {
@@ -602,7 +797,7 @@ async function runCommand(raw) {
         sys("usage: /join <P-|R-code>");
         break;
       }
-      await doJoin(args[0].trim());
+      await promptJoin(args[0].trim());
       break;
     }
     case "/who": {
@@ -669,6 +864,22 @@ async function runCommand(raw) {
       sys("confirm: /wipe confirm  (10s)");
       break;
     }
+    case "/burn": {
+      if (args[0] === "confirm") {
+        if (Date.now() > state.burnDeadline) {
+          sys("burn expired - /burn again");
+          break;
+        }
+        state.burnDeadline = 0;
+        sys("burning identity…");
+        await invoke("burn_identity");
+        break;
+      }
+      state.burnDeadline = Date.now() + 15000;
+      sys("destructive · wipes identity and exits");
+      sys("confirm: /burn confirm  (15s)");
+      break;
+    }
     case "/leave": {
       if (!state.active) {
         sys("no conversation");
@@ -706,9 +917,131 @@ async function runCommand(raw) {
       }
       break;
     }
-    default:
-      sys("unknown - /help");
+    case "/seal": {
+      const parsed = parseSealArgs(line);
+      if (!parsed || !parsed.kind) {
+        sys("usage: /seal <peer> <msg>  ·  /seal <peer> @ <file>");
+        break;
+      }
+      let kind;
+      let name;
+      let body;
+      if (parsed.kind === "file") {
+        if (!parsed.path) {
+          sys("usage: /seal <peer> @ <file>");
+          break;
+        }
+        kind = "file";
+        name = baseName(parsed.path) || "file";
+        body = parsed.path;
+      } else {
+        kind = "text";
+        name = "note";
+        body = parsed.body;
+      }
+      const defaultName =
+        kind === "file" ? `${name}.ratdrop` : `sealed-${parsed.peer}.ratdrop`;
+      const dest = await invoke("pick_save", { defaultName });
+      if (!dest) {
+        sys("cancelled");
+        break;
+      }
+      try {
+        const written = await invoke("seal_drop", {
+          peer: parsed.peer,
+          kind,
+          name,
+          body,
+          dest,
+        });
+        sys("sealed envelope · hand off yourself — not offline messaging", "ok");
+        sysValue("sealed  ", written, "", "sealed envelope · click to copy path");
+      } catch (e) {
+        sys(humanError(e));
+      }
+      break;
+    }
+    case "/drop": {
+      if (!rest) {
+        sys("usage: /drop <path>");
+        break;
+      }
+      try {
+        const opened = await invoke("open_drop", { path: rest });
+        if (opened.kind === "text" && opened.body_text != null) {
+          sys(`drop · text · from ${short(opened.sender)}`);
+          appendMsg(opened.body_text, "in", {}, { kind: "text" });
+        } else {
+          const bytes = opened.body_bytes?.length ?? 0;
+          sys(
+            `drop · ${opened.kind} · ${opened.name} · ${bytes}b · from ${short(opened.sender)}`
+          );
+        }
+      } catch (e) {
+        sys(humanError(e));
+      }
+      break;
+    }
+    case "/fp":
+    case "/fingerprint": {
+      try {
+        const who = args[0] || null;
+        const fp = await invoke("fingerprint", { who });
+        sysValue("fp  ", fp);
+      } catch (e) {
+        sys(humanError(e));
+      }
+      break;
+    }
+    case "/sound": {
+      const mode = (args[0] || "").toLowerCase();
+      if (mode !== "on" && mode !== "off") {
+        sys(`sound ${state.sound ? "on" : "off"}`);
+        break;
+      }
+      const on = mode === "on";
+      await invoke("set_sound", { enabled: on });
+      state.sound = on;
+      sys(`sound ${on ? "on" : "off"}`, "ok");
+      break;
+    }
+    case "/hotkey": {
+      if (!args.length) {
+        sys(`hotkey  ${state.hotkey || "—"}`);
+        break;
+      }
+      try {
+        const hk = await invoke("set_hotkey", { hotkey: args.join(" ") });
+        state.hotkey = hk;
+        sys(`hotkey  ${hk}`, "ok");
+      } catch (e) {
+        sys(humanError(e));
+      }
+      break;
+    }
+    default: {
+      const hint = suggestCommand(cmd);
+      if (hint) {
+        sys(`unknown - did you mean ${hint}?`);
+      } else {
+        sys("unknown - /help");
+      }
+    }
   }
+}
+
+async function promptJoin(code) {
+  if (!isValidJoinCode(code)) {
+    sys("codes start with P- (1:1) or R- (group)");
+    return;
+  }
+  if (isOwnPendingCode(code)) {
+    sys("that's your own code - give it to someone else");
+    return;
+  }
+  state.pendingJoin = code.trim();
+  updatePlaceholder();
+  sys(`join ${state.pendingJoin}?  y/n`);
 }
 
 async function doJoin(code) {
@@ -749,6 +1082,7 @@ async function doJoin(code) {
         { force: true }
       );
       sys("line live", "ok");
+      blip("connect");
     } else {
       const r = result.room;
       const live = (r.members || []).length > 0;
@@ -779,15 +1113,41 @@ async function tryWipeConfirm(raw) {
   return true;
 }
 
+async function handlePendingJoin(raw) {
+  if (!state.pendingJoin) return false;
+  const ans = raw.trim().toLowerCase();
+  if (ans === "y" || ans === "yes") {
+    const code = state.pendingJoin;
+    state.pendingJoin = null;
+    updatePlaceholder();
+    sys(`> join ${code}`);
+    await doJoin(code);
+    return true;
+  }
+  if (ans === "n" || ans === "no") {
+    state.pendingJoin = null;
+    updatePlaceholder();
+    sys("cancelled");
+    return true;
+  }
+  sys("y or n");
+  return true;
+}
+
 async function onSubmit() {
   const el = $("input");
   const raw = el.value;
   if (!raw.trim()) return;
   el.value = "";
   autoSize();
+  state.cmdHistIdx = -1;
+  state.draftInput = "";
   updatePlaceholder();
 
+  if (await handlePendingJoin(raw)) return;
+
   if (raw.trimStart().startsWith("/")) {
+    pushCmdHistory(raw.trim());
     sys(`> ${raw.trim()}`);
     try {
       await runCommand(raw.trim());
@@ -799,11 +1159,10 @@ async function onSubmit() {
 
   if (await tryWipeConfirm(raw)) return;
 
-  // Bare P-/R- code in the input = join
   const maybe = raw.trim();
-  if (isValidJoinCode(maybe) && !state.active) {
-    sys(`> /join ${maybe}`);
-    await doJoin(maybe);
+  if (isValidJoinCode(maybe)) {
+    sys(`> ${maybe}`);
+    await promptJoin(maybe);
     return;
   }
 
@@ -930,6 +1289,7 @@ async function demoConversationJoiner() {
   }
   await sleep(1500);
   sys("demo · joiner");
+  state.pendingJoin = null;
   sys(`> /join ${code}`);
   const result = await invoke("join_code", { code });
   await refreshLists();
@@ -1025,9 +1385,25 @@ function tabComplete() {
   const el = $("input");
   const v = el.value;
   if (!v.startsWith("/") || v.includes(" ")) return false;
-  const matches = COMMANDS.filter((c) => c.startsWith(v.toLowerCase()));
+  const q = v.toLowerCase();
+  const matches = COMMANDS.filter((c) => c.startsWith(q));
   if (matches.length === 1) {
-    el.value = matches[0] + (matches[0] === "/join" || matches[0] === "/go" || matches[0] === "/name" || matches[0] === "/hist" || matches[0] === "/file" || matches[0] === "/demo" ? " " : "");
+    const m = matches[0];
+    const needsSpace =
+      m === "/join" ||
+      m === "/go" ||
+      m === "/name" ||
+      m === "/hist" ||
+      m === "/file" ||
+      m === "/demo" ||
+      m === "/seal" ||
+      m === "/drop" ||
+      m === "/fp" ||
+      m === "/fingerprint" ||
+      m === "/sound" ||
+      m === "/hotkey" ||
+      m === "/connect";
+    el.value = m + (needsSpace ? " " : "");
     return true;
   }
   if (matches.length > 1) {
@@ -1037,8 +1413,40 @@ function tabComplete() {
   return false;
 }
 
+function cmdHistoryNav(key) {
+  const el = $("input");
+  if (state.cmdHistory.length === 0) return false;
+  if (key === "ArrowUp") {
+    if (state.cmdHistIdx === -1) {
+      state.draftInput = el.value;
+      state.cmdHistIdx = state.cmdHistory.length;
+    }
+    if (state.cmdHistIdx > 0) {
+      state.cmdHistIdx -= 1;
+      el.value = state.cmdHistory[state.cmdHistIdx];
+      autoSize();
+      return true;
+    }
+    return false;
+  }
+  if (key === "ArrowDown") {
+    if (state.cmdHistIdx === -1) return false;
+    if (state.cmdHistIdx < state.cmdHistory.length - 1) {
+      state.cmdHistIdx += 1;
+      el.value = state.cmdHistory[state.cmdHistIdx];
+      autoSize();
+      return true;
+    }
+    state.cmdHistIdx = -1;
+    el.value = state.draftInput;
+    autoSize();
+    return true;
+  }
+  return false;
+}
+
 async function playBoot() {
-  const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  const reduce = reduceMotion();
   const bootEl = $("boot");
   const appEl = $("app");
   if (reduce || !bootEl) {
@@ -1067,21 +1475,44 @@ async function boot() {
     })
     .catch(() => {});
 
-  await listen("message", (ev) => {
+  await listen("message", async (ev) => {
     const m = ev.payload;
     if (m.conversation_id !== state.active) {
       if (!m.outgoing && !state.demoRunning) {
         const label =
           peerLabel(m.sender_id) || short(m.conversation_id) || "peer";
         sys(`· ${label}`, "ok");
+        blip("message");
       }
       return;
     }
-    appendMsg(m.body, m.outgoing ? "out" : "in", false, m);
+    if (m.outgoing) {
+      appendMsg(m.body, "out", false, m);
+      return;
+    }
+    if (state.demoRunning || reduceMotion()) {
+      appendMsg(m.body, "in", false, m);
+    } else {
+      await appendMsgLive(m.body, "in", m);
+    }
+    blip("message");
   });
 
   await listen("peer_update", () => refreshLists());
   await listen("presence", () => refreshLists());
+
+  await listen("handshake", (ev) => {
+    const p = ev.payload || {};
+    if (p.phase === "negotiating") {
+      sysProgress("negotiating key…");
+    } else if (p.phase === "verifying") {
+      sysProgress("verifying…");
+    } else if (p.phase === "connected") {
+      clearProgress();
+      sys("connected", "ok");
+      blip("connect");
+    }
+  });
 
   await listen("paired", async (ev) => {
     if (state.demoRunning) {
@@ -1106,6 +1537,7 @@ async function boot() {
       { force: true }
     );
     sys("line live", "ok");
+    blip("connect");
   });
 
   await listen("conn_path", (ev) => {
@@ -1173,22 +1605,31 @@ async function boot() {
       if (tabComplete()) e.preventDefault();
       return;
     }
+    if (e.key === "ArrowUp" || e.key === "ArrowDown") {
+      if (cmdHistoryNav(e.key)) e.preventDefault();
+      return;
+    }
     if (e.key === "Escape") {
       e.preventDefault();
+      state.pendingJoin = null;
+      state.cmdHistIdx = -1;
       $("input").value = "";
       autoSize();
       stopTyping();
+      updatePlaceholder();
     }
   });
 
   $("input").addEventListener("paste", (e) => {
-    const text = (e.clipboardData || window.clipboardData)?.getData("text") || "";
+    const text =
+      (e.clipboardData || window.clipboardData)?.getData("text") || "";
     const trimmed = text.trim();
     if (!isValidJoinCode(trimmed)) return;
     if ($("input").value.trim()) return;
     e.preventDefault();
-    $("input").value = `/join ${trimmed}`;
-    autoSize();
+    state.pendingJoin = trimmed;
+    updatePlaceholder();
+    sys(`join ${trimmed}?  y/n`);
   });
 
   $("short-id").addEventListener("click", async () => {
@@ -1199,6 +1640,26 @@ async function boot() {
     } catch {
       /* ignore */
     }
+  });
+
+  $("fingerprint")?.addEventListener("click", async () => {
+    if (!state.fingerprint) return;
+    try {
+      await navigator.clipboard.writeText(state.fingerprint);
+      sys("fingerprint copied", "ok");
+    } catch {
+      /* ignore */
+    }
+  });
+
+  $("btn-hide")?.addEventListener("click", () => {
+    invoke("hide_window").catch(() => {
+      try {
+        getCurrentWebviewWindow().hide();
+      } catch {
+        /* ignore */
+      }
+    });
   });
 
   $("composer").onsubmit = (e) => {

@@ -153,6 +153,8 @@ body::after {
   padding: 14px 22px 8px;
   font-size: 13px;
   flex-shrink: 0;
+  -webkit-app-region: drag;
+  app-region: drag;
 }
 
 .brand {
@@ -160,6 +162,18 @@ body::after {
   font-size: 14px;
   color: var(--fg);
   font-weight: 500;
+  -webkit-app-region: drag;
+  app-region: drag;
+}
+
+#short-id,
+#fingerprint,
+.win-btn,
+#path-label,
+#code-ttl,
+.status-conv {
+  -webkit-app-region: no-drag;
+  app-region: no-drag;
 }
 
 #short-id {
@@ -173,6 +187,35 @@ body::after {
   color: var(--fg-soft);
 }
 
+.fp {
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  cursor: pointer;
+  opacity: 0.85;
+}
+
+.fp:hover {
+  color: var(--fg-soft);
+  opacity: 1;
+}
+
+.win-btn {
+  margin-left: auto;
+  background: transparent;
+  border: none;
+  color: var(--dim);
+  font-family: var(--font);
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0 4px;
+  transition: color var(--dur) var(--ease);
+}
+
+.win-btn:hover {
+  color: var(--fg);
+}
+
 .status-conv {
   flex: 1;
   overflow: hidden;
@@ -181,6 +224,7 @@ body::after {
   font-size: 12px;
   letter-spacing: 0.02em;
   transition: color var(--dur) var(--ease);
+  min-width: 0;
 }
 
 .path-label,

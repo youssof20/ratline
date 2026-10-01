@@ -1,6 +1,9 @@
 pub mod cli;
 mod app;
 mod codes;
+mod config;
+mod desktop;
+mod drop;
 mod identity;
 mod pairing;
 mod protocol;
@@ -14,6 +17,7 @@ use app::{App, CodeInspect, PeerInfo, RoomInfo, StatusSnapshot, UiMessage};
 use cli::{DemoKind, DemoRole, LaunchArgs};
 use serde::Serialize;
 use tauri::Manager;
+use tauri_plugin_global_shortcut::ShortcutState;
 
 fn default_data_dir() -> PathBuf {
     dirs::data_dir()
@@ -26,7 +30,6 @@ fn map_err(e: anyhow::Error) -> String {
     if s.to_lowercase().contains("ourself") {
         return "that's your own code - give it to someone else".into();
     }
-    // keep first clause only
     s.lines().next().unwrap_or(&s).to_string()
 }
 
@@ -88,7 +91,10 @@ async fn start_room(state: tauri::State<'_, Arc<App>>) -> Result<(String, String
 }
 
 #[tauri::command]
-async fn join_room(state: tauri::State<'_, Arc<App>>, code: String) -> Result<RoomInfo, String> {
+async fn join_room(
+    state: tauri::State<'_, Arc<App>>,
+    code: String,
+) -> Result<RoomInfo, String> {
     state.join_room_code(code).await.map_err(map_err)
 }
 
@@ -98,6 +104,14 @@ async fn connect_peer(
     endpoint_id: String,
 ) -> Result<(), String> {
     state.connect_peer(&endpoint_id).await.map_err(map_err)
+}
+
+#[tauri::command]
+async fn connect_named(
+    state: tauri::State<'_, Arc<App>>,
+    name: String,
+) -> Result<PeerInfo, String> {
+    state.connect_named(&name).await.map_err(map_err)
 }
 
 #[tauri::command]
@@ -166,11 +180,69 @@ async fn wipe_history(
 }
 
 #[tauri::command]
-async fn set_history(
-    state: tauri::State<'_, Arc<App>>,
-    enabled: bool,
-) -> Result<(), String> {
+async fn burn_identity(state: tauri::State<'_, Arc<App>>, app: tauri::AppHandle) -> Result<(), String> {
+    state.burn_all().map_err(map_err)?;
+    app.exit(0);
+    Ok(())
+}
+
+#[tauri::command]
+async fn set_history(state: tauri::State<'_, Arc<App>>, enabled: bool) -> Result<(), String> {
     state.set_history(enabled).map_err(map_err)
+}
+
+#[tauri::command]
+async fn set_sound(state: tauri::State<'_, Arc<App>>, enabled: bool) -> Result<(), String> {
+    state.set_sound(enabled).map_err(map_err)
+}
+
+#[tauri::command]
+async fn set_hotkey(
+    state: tauri::State<'_, Arc<App>>,
+    app: tauri::AppHandle,
+    hotkey: String,
+) -> Result<String, String> {
+    let hk = state.set_hotkey(&hotkey).map_err(map_err)?;
+    desktop::reregister_hotkey(&app, &hk)?;
+    Ok(hk)
+}
+
+#[tauri::command]
+async fn fingerprint(
+    state: tauri::State<'_, Arc<App>>,
+    who: Option<String>,
+) -> Result<String, String> {
+    match who {
+        Some(w) if !w.trim().is_empty() => state.fingerprint_peer(&w).map_err(map_err),
+        _ => Ok(state.fingerprint_self()),
+    }
+}
+
+#[tauri::command]
+async fn seal_drop(
+    state: tauri::State<'_, Arc<App>>,
+    peer: String,
+    kind: String,
+    name: String,
+    body: String,
+    dest: String,
+) -> Result<String, String> {
+    let bytes = if kind == "file" {
+        tokio::fs::read(&body).await.map_err(|e| e.to_string())?
+    } else {
+        body.into_bytes()
+    };
+    state
+        .seal_drop(&peer, &kind, &name, &bytes, PathBuf::from(dest))
+        .map_err(map_err)
+}
+
+#[tauri::command]
+async fn open_drop(
+    state: tauri::State<'_, Arc<App>>,
+    path: String,
+) -> Result<crate::drop::OpenedDrop, String> {
+    state.open_drop(PathBuf::from(path)).map_err(map_err)
 }
 
 #[tauri::command]
@@ -194,11 +266,14 @@ async fn leave_conversation(
 async fn pick_file(app: tauri::AppHandle) -> Result<Option<String>, String> {
     use tauri_plugin_dialog::DialogExt;
     tokio::task::spawn_blocking(move || {
-        app.dialog().file().blocking_pick_file().and_then(|p| {
-            p.into_path()
-                .ok()
-                .map(|pb| pb.to_string_lossy().into_owned())
-        })
+        app.dialog()
+            .file()
+            .blocking_pick_file()
+            .and_then(|p| {
+                p.into_path()
+                    .ok()
+                    .map(|pb| pb.to_string_lossy().into_owned())
+            })
     })
     .await
     .map_err(|e| e.to_string())
@@ -223,6 +298,14 @@ async fn pick_save(app: tauri::AppHandle, default_name: String) -> Result<Option
 }
 
 #[tauri::command]
+async fn hide_window(app: tauri::AppHandle) -> Result<(), String> {
+    if let Some(w) = app.get_webview_window("main") {
+        w.hide().map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
 async fn get_launch_config(state: tauri::State<'_, LaunchArgs>) -> Result<LaunchConfig, String> {
     Ok(LaunchConfig {
         demo: state.demo.map(|d| d.as_str().to_string()),
@@ -242,7 +325,6 @@ async fn run_update(app: tauri::AppHandle) -> Result<(), String> {
     update::run_update(app).await.map_err(map_err)
 }
 
-/// Host-only: spawn a second process that joins with the given code.
 #[tauri::command]
 async fn spawn_demo_peer(
     launch: tauri::State<'_, LaunchArgs>,
@@ -288,7 +370,6 @@ pub fn run_with_args(args: LaunchArgs) {
         .clone()
         .unwrap_or_else(default_data_dir);
 
-    // Demo host gets an isolated data dir so it never touches the user's identity.
     let data = if args.demo.is_some() && args.data_dir.is_none() {
         let d = std::env::temp_dir().join(format!("ratline-demo-{}-host", std::process::id()));
         let _ = std::fs::create_dir_all(&d);
@@ -305,15 +386,31 @@ pub fn run_with_args(args: LaunchArgs) {
         _ => "ratline",
     };
 
+    let boot_cfg = config::Config::load(&data);
+    let hotkey = boot_cfg.hotkey.clone();
     let args_managed = args.clone();
+
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init())
+        .plugin(
+            tauri_plugin_global_shortcut::Builder::new()
+                .with_shortcuts([hotkey.as_str()])
+                .expect("hotkey")
+                .with_handler(|app, _shortcut, event| {
+                    if event.state == ShortcutState::Pressed {
+                        let _ = desktop::toggle_summon(app);
+                    }
+                })
+                .build(),
+        )
         .manage(args_managed)
         .setup(move |app| {
             if let Some(w) = app.get_webview_window("main") {
                 let _ = w.set_title(window_title);
             }
             let handle = app.handle().clone();
+            desktop::setup_tray_and_close(&handle)?;
             let state = tauri::async_runtime::block_on(App::bootstrap(data))
                 .expect("bootstrap ratline");
             state.set_app_handle(handle);
@@ -331,17 +428,25 @@ pub fn run_with_args(args: LaunchArgs) {
             start_room,
             join_room,
             connect_peer,
+            connect_named,
             send_text,
             send_typing,
             send_file,
             download_file,
             get_history,
             wipe_history,
+            burn_identity,
             set_history,
+            set_sound,
+            set_hotkey,
+            fingerprint,
+            seal_drop,
+            open_drop,
             set_label,
             leave_conversation,
             pick_file,
             pick_save,
+            hide_window,
             get_launch_config,
             spawn_demo_peer,
             check_update,

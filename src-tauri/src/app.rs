@@ -27,6 +27,8 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::codes::{self, CODE_TTL_SECS};
+use crate::config::Config;
+use crate::drop as dead_drop;
 use crate::identity::Identity;
 use crate::pairing::{self, IdentityPayload};
 use crate::protocol::{self, ChatMsg, GossipMsg, CHAT_ALPN, PAIR_ALPN};
@@ -75,7 +77,10 @@ pub struct UiMessage {
 pub struct StatusSnapshot {
     pub endpoint_id: String,
     pub short_id: String,
+    pub fingerprint: String,
     pub history_enabled: bool,
+    pub sound: bool,
+    pub hotkey: String,
     pub pairing_code: Option<String>,
     pub pairing_expires_in: Option<u64>,
     pub pairing_kind: Option<String>,
@@ -112,6 +117,8 @@ struct RoomSession {
 pub struct App {
     pub identity: Identity,
     pub storage: Storage,
+    pub data_dir: PathBuf,
+    pub config: Mutex<Config>,
     endpoint: Endpoint,
     gossip: Gossip,
     blobs: MemStore,
@@ -128,6 +135,7 @@ impl App {
         let identity = Identity::load_or_create(&data_dir)?;
         let db_key = storage::db_key_from_identity(&identity.secret.to_bytes());
         let storage = Storage::open(&data_dir, &db_key)?;
+        let config = Config::load(&data_dir);
 
         let endpoint = Endpoint::builder(presets::N0)
             .secret_key(identity.secret.clone())
@@ -157,6 +165,8 @@ impl App {
         let app = Arc::new(Self {
             identity,
             storage,
+            data_dir,
+            config: Mutex::new(config),
             endpoint,
             gossip,
             blobs,
@@ -208,7 +218,10 @@ impl App {
         Ok(StatusSnapshot {
             endpoint_id: hex::encode(id),
             short_id: codes::short_id(&id),
+            fingerprint: codes::fingerprint(&id),
             history_enabled: self.storage.history_enabled()?,
+            sound: self.config.lock().sound,
+            hotkey: self.config.lock().hotkey.clone(),
             pairing_code: code,
             pairing_expires_in: exp,
             pairing_kind: kind,
@@ -538,12 +551,65 @@ impl App {
         if self.peers.contains_key(endpoint_id_hex) {
             return Ok(());
         }
+        self.emit(
+            "handshake",
+            serde_json::json!({ "phase": "negotiating", "peer": endpoint_id_hex }),
+        );
         let conn = self
             .endpoint
             .connect(id, CHAT_ALPN)
             .await
             .context("connect peer")?;
-        self.spawn_peer_session(conn, true).await
+        self.emit(
+            "handshake",
+            serde_json::json!({ "phase": "verifying", "peer": endpoint_id_hex }),
+        );
+        self.spawn_peer_session(conn, true).await?;
+        self.emit(
+            "handshake",
+            serde_json::json!({ "phase": "connected", "peer": endpoint_id_hex }),
+        );
+        Ok(())
+    }
+
+    /// Reconnect a known peer by local nickname or id prefix.
+    pub async fn connect_named(&self, name: &str) -> Result<PeerInfo> {
+        let q = name.trim().to_lowercase();
+        let peers = self.storage.list_peers()?;
+        let peer = peers
+            .iter()
+            .find(|p| !p.label.is_empty() && p.label.to_lowercase() == q)
+            .or_else(|| {
+                peers
+                    .iter()
+                    .find(|p| !p.label.is_empty() && p.label.to_lowercase().starts_with(&q))
+            })
+            .or_else(|| {
+                peers.iter().find(|p| {
+                    p.endpoint_id.starts_with(&q)
+                        || codes::short_id(
+                            &hex::decode(&p.endpoint_id)
+                                .ok()
+                                .and_then(|b| <[u8; 32]>::try_from(b).ok())
+                                .unwrap_or([0u8; 32]),
+                        ) == q
+                })
+            })
+            .ok_or_else(|| anyhow!("no known peer matching '{name}' — pair once with /connect"))?
+            .clone();
+        self.connect_peer(&peer.endpoint_id).await?;
+        let connected = self.peers.contains_key(&peer.endpoint_id);
+        let path = self
+            .peers
+            .get(&peer.endpoint_id)
+            .map(|s| s.path.lock().clone())
+            .unwrap_or_else(|| "OFFLINE".into());
+        Ok(PeerInfo {
+            endpoint_id: peer.endpoint_id,
+            label: peer.label,
+            connected,
+            path,
+        })
     }
 
     async fn reconnect_known(&self) -> Result<()> {
@@ -895,6 +961,99 @@ impl App {
         self.storage.wipe_conversation(conversation_id)
     }
 
+    /// Destroy identity + history. App should exit; next launch is a new person.
+    pub fn burn_all(&self) -> Result<()> {
+        let dir = &self.data_dir;
+        let identity = dir.join("identity.json");
+        let history = dir.join("history.db");
+        let history_wal = dir.join("history.db-wal");
+        let history_shm = dir.join("history.db-shm");
+        for p in [&identity, &history, &history_wal, &history_shm] {
+            let _ = std::fs::remove_file(p);
+        }
+        Ok(())
+    }
+
+    pub fn set_sound(&self, on: bool) -> Result<()> {
+        let mut cfg = self.config.lock();
+        cfg.sound = on;
+        cfg.save(&self.data_dir)?;
+        Ok(())
+    }
+
+    pub fn set_hotkey(&self, hotkey: &str) -> Result<String> {
+        let mut cfg = self.config.lock();
+        cfg.hotkey = hotkey.to_string();
+        cfg.save(&self.data_dir)?;
+        Ok(cfg.hotkey.clone())
+    }
+
+    pub fn fingerprint_self(&self) -> String {
+        codes::fingerprint(&self.identity.endpoint_id_bytes())
+    }
+
+    pub fn fingerprint_peer(&self, name_or_id: &str) -> Result<String> {
+        let q = name_or_id.trim().to_lowercase();
+        let peers = self.storage.list_peers()?;
+        let peer = peers
+            .iter()
+            .find(|p| !p.label.is_empty() && p.label.to_lowercase() == q)
+            .or_else(|| {
+                peers
+                    .iter()
+                    .find(|p| !p.label.is_empty() && p.label.to_lowercase().starts_with(&q))
+            })
+            .or_else(|| peers.iter().find(|p| p.endpoint_id.starts_with(&q)))
+            .ok_or_else(|| anyhow!("peer not found"))?;
+        let mut id = [0u8; 32];
+        let raw = hex::decode(&peer.endpoint_id).context("peer id")?;
+        if raw.len() != 32 {
+            bail!("bad peer id");
+        }
+        id.copy_from_slice(&raw);
+        Ok(codes::fingerprint(&id))
+    }
+
+    /// Seal a text note or small file for a known peer. Returns path written.
+    pub fn seal_drop(
+        &self,
+        peer_query: &str,
+        kind: &str,
+        name: &str,
+        body: &[u8],
+        dest: PathBuf,
+    ) -> Result<String> {
+        let q = peer_query.trim().to_lowercase();
+        let peers = self.storage.list_peers()?;
+        let peer = peers
+            .iter()
+            .find(|p| !p.label.is_empty() && p.label.to_lowercase() == q)
+            .or_else(|| {
+                peers
+                    .iter()
+                    .find(|p| !p.label.is_empty() && p.label.to_lowercase().starts_with(&q))
+            })
+            .or_else(|| peers.iter().find(|p| p.endpoint_id.starts_with(&q)))
+            .ok_or_else(|| anyhow!("unknown peer '{peer_query}' — need a known contact"))?;
+        let mut recip = [0u8; 32];
+        let raw = hex::decode(&peer.endpoint_id)?;
+        if raw.len() != 32 {
+            bail!("bad peer id");
+        }
+        recip.copy_from_slice(&raw);
+        let secret = self.identity.secret.to_bytes();
+        let sealed = dead_drop::seal(&secret, &recip, kind, name, body)?;
+        dead_drop::write_drop_file(&dest, &sealed)?;
+        Ok(dest.to_string_lossy().into_owned())
+    }
+
+    pub fn open_drop(&self, path: PathBuf) -> Result<dead_drop::OpenedDrop> {
+        let data = dead_drop::read_drop_file(&path)?;
+        let secret = self.identity.secret.to_bytes();
+        let id = self.identity.endpoint_id_bytes();
+        dead_drop::open(&secret, &id, &data)
+    }
+
     pub fn set_history(&self, on: bool) -> Result<()> {
         self.storage.set_history_enabled(on)
     }
@@ -971,6 +1130,23 @@ fn classify_remote_info(info: &RemoteInfo) -> String {
     }
 }
 
+fn notify_if_background(app: &App, title: &str, body: &str) {
+    let Some(handle) = app.app_handle.lock().clone() else {
+        return;
+    };
+    if crate::desktop::window_focused(&handle) {
+        return;
+    }
+    use tauri_plugin_notification::NotificationExt;
+    let preview: String = body.chars().take(80).collect();
+    let _ = handle
+        .notification()
+        .builder()
+        .title(title)
+        .body(preview)
+        .show();
+}
+
 fn handle_chat_incoming(app: &App, conv: &str, msg: ChatMsg) {
     match msg {
         ChatMsg::Text { id, body, ts } => {
@@ -983,6 +1159,7 @@ fn handle_chat_incoming(app: &App, conv: &str, msg: ChatMsg) {
                 kind: "text".into(),
                 created_at: ts,
             });
+            notify_if_background(app, "ratline", &body);
             app.emit(
                 "message",
                 UiMessage {
@@ -1012,6 +1189,7 @@ fn handle_chat_incoming(app: &App, conv: &str, msg: ChatMsg) {
                 kind: "file".into(),
                 created_at: ts,
             });
+            notify_if_background(app, "ratline", &format!("file · {name}"));
             app.emit(
                 "message",
                 UiMessage {
@@ -1059,6 +1237,7 @@ fn handle_gossip_event(
                 kind: "text".into(),
                 created_at: ts,
             });
+            notify_if_background(app, "ratline", &body);
             app.emit(
                 "message",
                 UiMessage {

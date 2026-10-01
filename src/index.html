@@ -14,12 +14,14 @@
   </div>
 
   <div class="app" id="app">
-    <header class="status">
-      <span class="brand">ratline</span>
+    <header class="status" data-tauri-drag-region>
+      <span class="brand" data-tauri-drag-region>ratline</span>
       <span id="short-id" class="dim" title="your id">····</span>
+      <span id="fingerprint" class="fp dim" title="fingerprint — verify out of band">····</span>
       <span id="status-conv" class="status-conv dim"></span>
       <span id="path-label" class="path-label"></span>
       <span id="code-ttl" class="code-ttl"></span>
+      <button type="button" id="btn-hide" class="win-btn" title="hide (tray)" aria-label="hide">×</button>
     </header>
 
     <main>

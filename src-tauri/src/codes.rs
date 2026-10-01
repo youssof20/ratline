@@ -157,6 +157,19 @@ pub fn short_id(bytes: &[u8]) -> String {
     enc.chars().take(8).collect::<String>().to_lowercase()
 }
 
+/// Spoken fingerprint for out-of-band verify — derived from the public id.
+/// Example: `F-H3K9-M2PQ`
+pub fn fingerprint(endpoint_id: &[u8; 32]) -> String {
+    let digest = blake3::hash(endpoint_id);
+    let enc = encode_crockford(&digest.as_bytes()[..5]);
+    let body = if enc.len() >= 8 {
+        format!("{}-{}", &enc[..4], &enc[4..8])
+    } else {
+        enc
+    };
+    format!("F-{body}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
