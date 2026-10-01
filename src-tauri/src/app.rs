@@ -1,6 +1,6 @@
 //! Application state: endpoint, pairing, chat, gossip, blobs.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -57,10 +57,16 @@ pub struct PeerInfo {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
+pub struct RoomMember {
+    pub endpoint_id: String,
+    pub label: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
 pub struct RoomInfo {
     pub topic_id: String,
     pub label: String,
-    pub members: Vec<String>,
+    pub members: Vec<RoomMember>,
 }
 
 #[derive(Clone, Serialize)]
@@ -114,6 +120,7 @@ struct PeerSession {
 struct RoomSession {
     sender: GossipSender,
     members: Arc<Mutex<HashSet<String>>>,
+    labels: Arc<Mutex<HashMap<String, String>>>,
     abort: tokio::task::AbortHandle,
 }
 
@@ -264,11 +271,26 @@ impl App {
         Ok(stored
             .into_iter()
             .map(|r| {
-                let members = self
+                let (members, labels) = self
                     .rooms
                     .get(&r.topic_id)
-                    .map(|s| s.members.lock().iter().cloned().collect())
+                    .map(|s| {
+                        (
+                            s.members.lock().iter().cloned().collect::<Vec<_>>(),
+                            s.labels.lock().clone(),
+                        )
+                    })
                     .unwrap_or_default();
+                let members = members
+                    .into_iter()
+                    .map(|endpoint_id| {
+                        let label = labels.get(&endpoint_id).cloned().unwrap_or_default();
+                        RoomMember {
+                            endpoint_id,
+                            label,
+                        }
+                    })
+                    .collect();
                 RoomInfo {
                     topic_id: r.topic_id,
                     label: r.label,
@@ -361,13 +383,13 @@ impl App {
                 match preview_room(kind, &body).await {
                     Ok(n) => Ok(CodeInspect {
                         kind: "room".into(),
-                        summary: format!("room · {n} present"),
+                        summary: format!("party · {n} present"),
                         members: Some(n),
                         reachable: true,
                     }),
                     Err(_) => Ok(CodeInspect {
                         kind: "room".into(),
-                        summary: "room · host not reached".into(),
+                        summary: "party · host not reached".into(),
                         members: None,
                         reachable: false,
                     }),
@@ -388,10 +410,11 @@ impl App {
                     password,
                     self.identity.secret.clone(),
                     String::new(),
+                    false,
                 )
                 .await?;
                 if topic.is_some() {
-                    bail!("peer code returned a room topic - use an R- code for rooms");
+                    bail!("peer code returned a room topic - use an R- code for parties");
                 }
                 Ok(serde_json::json!({ "kind": "peer", "peer": peer }))
             }
@@ -403,6 +426,7 @@ impl App {
                     password,
                     self.identity.secret.clone(),
                     String::new(),
+                    true, // party: skip DM side-channel
                 )
                 .await?;
                 let topic_bytes = topic.unwrap_or_else(|| codes::room_topic_from_code(&body));
@@ -411,8 +435,9 @@ impl App {
                 let bootstrap = vec![parse_endpoint_id(&peer.endpoint_id)?];
                 self.storage.upsert_room(&StoredRoom {
                     topic_id: topic_hex.clone(),
-                    label: format!("room-{}", codes::short_id(&topic_bytes)),
+                    label: format!("party-{}", codes::short_id(&topic_bytes)),
                     created_at: chrono::Utc::now().timestamp(),
+                    bootstrap: peer.endpoint_id.clone(),
                 })?;
                 self.join_room_inner(topic_id, topic_hex.clone(), bootstrap)
                     .await?;
@@ -422,10 +447,10 @@ impl App {
                     .find(|r| r.topic_id == topic_hex)
                     .unwrap_or(RoomInfo {
                         topic_id: topic_hex,
-                        label: format!("room-{}", codes::short_id(&topic_bytes)),
+                        label: format!("party-{}", codes::short_id(&topic_bytes)),
                         members: vec![],
                     });
-                Ok(serde_json::json!({ "kind": "room", "room": room, "peer": peer }))
+                Ok(serde_json::json!({ "kind": "room", "room": room }))
             }
         }
     }
@@ -439,8 +464,9 @@ impl App {
 
         self.storage.upsert_room(&StoredRoom {
             topic_id: topic_hex.clone(),
-            label: format!("room-{}", codes::short_id(&topic_bytes)),
+            label: format!("party-{}", codes::short_id(&topic_bytes)),
             created_at: chrono::Utc::now().timestamp(),
+            bootstrap: String::new(),
         })?;
         self.join_room_inner(topic, topic_hex.clone(), vec![])
             .await?;
@@ -513,7 +539,9 @@ impl App {
         let gossip_topic = self.gossip.subscribe(topic, bootstrap).await?;
         let (sender, mut receiver) = gossip_topic.split();
         let members = Arc::new(Mutex::new(HashSet::new()));
+        let labels = Arc::new(Mutex::new(HashMap::new()));
         let members2 = members.clone();
+        let labels2 = labels.clone();
         let app = app_ref()?;
         let tid = topic_hex.clone();
 
@@ -522,16 +550,19 @@ impl App {
                 match ev {
                     Ok(Event::Received(msg)) => {
                         if let Ok(g) = protocol::decode_gossip(&msg.content) {
-                            handle_gossip_event(&app, &tid, g, &members2);
+                            handle_gossip_event(&app, &tid, g, &members2, &labels2);
                         }
                     }
                     Ok(Event::NeighborUp(id)) => {
-                        members2.lock().insert(hex::encode(id.as_bytes()));
+                        let hex_id = hex::encode(id.as_bytes());
+                        members2.lock().insert(hex_id);
                         emit_presence(&app, &tid, &members2);
+                        persist_room_bootstrap(&app, &tid, &members2);
                     }
                     Ok(Event::NeighborDown(id)) => {
                         members2.lock().remove(&hex::encode(id.as_bytes()));
                         emit_presence(&app, &tid, &members2);
+                        persist_room_bootstrap(&app, &tid, &members2);
                     }
                     _ => {}
                 }
@@ -539,17 +570,20 @@ impl App {
         });
 
         let me = hex::encode(self.identity.endpoint_id_bytes());
+        let handle = codes::short_id(&self.identity.endpoint_id_bytes());
         let payload = protocol::encode_gossip(&GossipMsg::Presence {
-            sender: me,
-            label: String::new(),
+            sender: me.clone(),
+            label: handle.clone(),
         })?;
         let _ = sender.broadcast(payload.into()).await;
+        labels.lock().insert(me, handle);
 
         self.rooms.insert(
             topic_hex,
             RoomSession {
                 sender,
                 members,
+                labels,
                 abort: task.abort_handle(),
             },
         );
@@ -642,6 +676,32 @@ impl App {
         for p in self.storage.list_peers()? {
             if let Err(e) = self.connect_peer(&p.endpoint_id).await {
                 tracing::debug!("could not reach {}: {e:#}", p.endpoint_id);
+            }
+        }
+        for room in self.storage.list_rooms()? {
+            if self.rooms.contains_key(&room.topic_id) {
+                continue;
+            }
+            let Ok(raw) = hex::decode(&room.topic_id) else {
+                continue;
+            };
+            if raw.len() != 32 {
+                continue;
+            }
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&raw);
+            let topic = TopicId::from_bytes(arr);
+            let mut bootstrap = Vec::new();
+            for part in room.bootstrap.split(',').filter(|s| !s.is_empty()) {
+                if let Ok(id) = parse_endpoint_id(part) {
+                    bootstrap.push(id);
+                }
+            }
+            if let Err(e) = self
+                .join_room_inner(topic, room.topic_id.clone(), bootstrap)
+                .await
+            {
+                tracing::debug!("could not rejoin party {}: {e:#}", room.topic_id);
             }
         }
         Ok(())
@@ -1160,6 +1220,16 @@ fn emit_presence(app: &App, tid: &str, members: &Arc<Mutex<HashSet<String>>>) {
     );
 }
 
+fn persist_room_bootstrap(app: &App, tid: &str, members: &Arc<Mutex<HashSet<String>>>) {
+    let boot = members
+        .lock()
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(",");
+    let _ = app.storage.set_room_bootstrap(tid, &boot);
+}
+
 fn parse_endpoint_id(hex_str: &str) -> Result<EndpointId> {
     let bytes = hex::decode(hex_str).context("hex endpoint id")?;
     if bytes.len() != 32 {
@@ -1283,6 +1353,7 @@ fn handle_gossip_event(
     topic: &str,
     g: GossipMsg,
     members: &Arc<Mutex<HashSet<String>>>,
+    labels: &Arc<Mutex<HashMap<String, String>>>,
 ) {
     match g {
         GossipMsg::Chat {
@@ -1353,9 +1424,13 @@ fn handle_gossip_event(
                 },
             );
         }
-        GossipMsg::Presence { sender, .. } => {
-            members.lock().insert(sender);
+        GossipMsg::Presence { sender, label } => {
+            members.lock().insert(sender.clone());
+            if !label.is_empty() {
+                labels.lock().insert(sender, label);
+            }
             emit_presence(app, topic, members);
+            persist_room_bootstrap(app, topic, members);
         }
     }
 }
@@ -1520,29 +1595,55 @@ async fn run_pairing_host(
                             tracing::warn!("peer joined with our own identity (self-join)");
                             continue;
                         }
-                        app.storage.upsert_peer(&StoredPeer {
-                            endpoint_id: their_hex.clone(),
-                            label: their.label.clone(),
-                            created_at: chrono::Utc::now().timestamp(),
-                        })?;
-                        if single_use {
-                            *app.pending.lock() = None;
-                        }
-                        app.emit("paired", PeerInfo {
-                            endpoint_id: their_hex.clone(),
-                            label: their.label,
-                            connected: false,
-                            path: "...".into(),
-                            verified: app.storage.is_peer_verified(&their_hex).unwrap_or(false),
-                        });
-                        if let Err(e) = app.connect_peer(&their_hex).await {
-                            tracing::debug!("post-pair connect: {e:#}");
+                        let is_party = topic_id.is_some();
+                        if is_party {
+                            // stay on the party line — no 1:1 side channel
+                            if let Some(ref th) = topic_hex {
+                                if let Some(session) = app.rooms.get(th) {
+                                    let label = if their.label.is_empty() {
+                                        codes::short_id(&their.endpoint_id)
+                                    } else {
+                                        their.label.clone()
+                                    };
+                                    session.members.lock().insert(their_hex.clone());
+                                    session.labels.lock().insert(their_hex.clone(), label.clone());
+                                    emit_presence(&app, th, &session.members);
+                                    persist_room_bootstrap(&app, th, &session.members);
+                                }
+                                app.emit(
+                                    "party_join",
+                                    serde_json::json!({
+                                        "topic": th,
+                                        "endpoint_id": their_hex,
+                                        "label": their.label,
+                                    }),
+                                );
+                            }
+                        } else {
+                            app.storage.upsert_peer(&StoredPeer {
+                                endpoint_id: their_hex.clone(),
+                                label: their.label.clone(),
+                                created_at: chrono::Utc::now().timestamp(),
+                            })?;
+                            if single_use {
+                                *app.pending.lock() = None;
+                            }
+                            app.emit("paired", PeerInfo {
+                                endpoint_id: their_hex.clone(),
+                                label: their.label,
+                                connected: false,
+                                path: "...".into(),
+                                verified: app.storage.is_peer_verified(&their_hex).unwrap_or(false),
+                            });
+                            if let Err(e) = app.connect_peer(&their_hex).await {
+                                tracing::debug!("post-pair connect: {e:#}");
+                            }
                         }
                         if single_use {
                             ep.close().await;
                             return Ok(());
                         }
-                        // room: keep listening for more joiners
+                        // party: keep listening for more joiners
                     }
                     Err(e) => tracing::warn!("pair attempt failed: {e:#}"),
                 }
@@ -1588,6 +1689,7 @@ async fn run_pairing_join(
     password: String,
     long_term: SecretKey,
     label: String,
+    party: bool,
 ) -> Result<(PeerInfo, Option<[u8; 32]>)> {
     let eph = codes::ephemeral_secret(kind, &body);
     let eph_id = eph.public();
@@ -1622,22 +1724,24 @@ async fn run_pairing_join(
     if their_hex == me {
         bail!("that's your own code - give it to someone else");
     }
-    app.storage.upsert_peer(&StoredPeer {
-        endpoint_id: their_hex.clone(),
-        label: their.label.clone(),
-        created_at: chrono::Utc::now().timestamp(),
-    })?;
 
     let topic = their.topic_id;
-    if let Err(e) = app.connect_peer(&their_hex).await {
-        tracing::debug!("post-join connect: {e:#}");
+    if !party {
+        app.storage.upsert_peer(&StoredPeer {
+            endpoint_id: their_hex.clone(),
+            label: their.label.clone(),
+            created_at: chrono::Utc::now().timestamp(),
+        })?;
+        if let Err(e) = app.connect_peer(&their_hex).await {
+            tracing::debug!("post-join connect: {e:#}");
+        }
     }
 
     Ok((
         PeerInfo {
             endpoint_id: their_hex.clone(),
             label: their.label,
-            connected: true,
+            connected: !party,
             path: "...".into(),
             verified: app.storage.is_peer_verified(&their_hex).unwrap_or(false),
         },

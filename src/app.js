@@ -13,6 +13,7 @@ const COMMANDS = [
   "/fp",
   "/verify",
   "/file",
+  "/party",
   "/room",
   "/seal",
   "/drop",
@@ -221,12 +222,15 @@ function updateStatusBar() {
     updatePlaceholder();
     return;
   }
-  const tag = state.activeKind === "room" ? "group" : "dm";
+  const tag = state.activeKind === "room" ? "party" : "dm";
   const name = state.activeLabel || short(state.active);
   let mark = "";
   if (state.activeKind === "peer") {
     const p = state.peers.find((x) => x.endpoint_id === state.active);
     if (p?.verified) mark = " · ok";
+  } else if (state.activeKind === "room") {
+    const n = roomMemberCount() + 1;
+    mark = n > 1 ? ` · ${n}` : "";
   }
   $("status-conv").textContent = `${tag}:${name}${mark}`;
   updatePlaceholder();
@@ -253,7 +257,7 @@ function roomMemberCount() {
 }
 
 function isGroupRoom() {
-  return state.activeKind === "room" && roomMemberCount() + 1 > 2;
+  return state.activeKind === "room";
 }
 
 function peerLabel(senderId) {
@@ -262,8 +266,17 @@ function peerLabel(senderId) {
   const p = state.peers.find((x) => x.endpoint_id === senderId);
   if (p?.label) return p.label;
   const r = state.rooms.find((x) => x.topic_id === state.active);
-  const m = (r?.members || []).find((x) => x === senderId || x?.id === senderId);
-  if (m && typeof m === "object" && m.label) return m.label;
+  const m = (r?.members || []).find(
+    (x) =>
+      x === senderId ||
+      x?.endpoint_id === senderId ||
+      x?.id === senderId
+  );
+  if (typeof m === "string") return short(m);
+  if (m && typeof m === "object") {
+    if (m.label) return m.label;
+    if (m.endpoint_id) return short(m.endpoint_id);
+  }
   return short(senderId);
 }
 
@@ -292,7 +305,7 @@ function sys(text, cls) {
     kind = "err";
   } else if (
     !kind &&
-    /copied|connected|direct|joined|named |history on|erased|line live|group live|verified|up to date|sealed envelope|sound |hotkey |forgotten/i.test(
+    /copied|connected|direct|joined|named |history on|erased|line live|group live|party live|verified|up to date|sealed envelope|sound |hotkey |forgotten/i.test(
       t
     )
   ) {
@@ -521,7 +534,7 @@ async function refreshLists() {
 
 function trackCodeExpiry(code, kind, secs) {
   if (kind === "room") {
-    setCodeTtl("room");
+    setCodeTtl("party");
     return;
   }
   if (state.lastCode === code && state.codeTimer) return;
@@ -592,7 +605,7 @@ function buildIndex() {
       kind: "room",
       label: r.label || short(r.topic_id),
       path: n ? "LIVE" : "WAITING",
-      members: n,
+      members: n + 1,
     });
   }
   return state.index;
@@ -633,8 +646,8 @@ function listWho() {
     return;
   }
   idx.forEach((c, i) => {
-    const kindLabel = c.kind === "room" ? "group" : "dm";
-    const extra = c.kind === "room" ? ` · ${c.members ?? 0}` : "";
+    const kindLabel = c.kind === "room" ? "party" : "dm";
+    const extra = c.kind === "room" ? ` · ${c.members ?? 1}` : "";
     sys(
       `${i + 1}. ${kindLabel} ${c.label}  ${prettyPath(c.path)}${extra}${
         c.kind === "peer" && state.peers.find((p) => p.endpoint_id === c.id)?.verified
@@ -659,7 +672,9 @@ function normalizeCommand(cmd) {
   const map = {
     "/c": "/connect",
     "/j": "/join",
-    "/r": "/room",
+    "/r": "/party",
+    "/party": "/party",
+    "/room": "/party",
     "/h": "/help",
     "/w": "/who",
     "/u": "/update",
@@ -709,7 +724,6 @@ async function runCommand(raw) {
     case "/help": {
       if (args[0] === "more" || args[0] === "all") {
         sys("<?>", "help");
-        sys("/room  group code (live only · both online)");
         sys("/seal /drop  sealed envelope handoff · not a mailbox");
         sys("/hist on|off  ·  /wipe  ·  /burn");
         sys("/cancel  revoke pairing code");
@@ -721,6 +735,7 @@ async function runCommand(raw) {
       sys("live line · both must be online");
       sys("/connect  P- code  ·  /connect <name>  known peer");
       sys("/join <code>  ·  /verify  after pair");
+      sys("/party  R- code · live party line");
       sys("/go · /who · /leave · /clear · /name · /fp · /file");
       sys("/help more");
       break;
@@ -804,13 +819,21 @@ async function runCommand(raw) {
       }
       break;
     }
+    case "/party":
     case "/room": {
-      sys("group · live only · both sides online");
+      sys("party line · everyone online");
       const [code, topic] = await invoke("start_room");
       await refreshLists();
       sysValue("code  ", code);
       await copyCode(code);
-      await openConv(topic, "room", short(topic), "WAITING", { force: true });
+      const r = state.rooms.find((x) => x.topic_id === topic);
+      await openConv(
+        topic,
+        "room",
+        r?.label || `party-${short(topic)}`,
+        "WAITING",
+        { force: true }
+      );
       break;
     }
     case "/join": {
@@ -1078,7 +1101,7 @@ async function runCommand(raw) {
 
 async function promptJoin(code) {
   if (!isValidJoinCode(code)) {
-    sys("codes start with P- (1:1) or R- (group)");
+    sys("codes start with P- (1:1) or R- (party)");
     return;
   }
   if (isOwnPendingCode(code)) {
@@ -1092,7 +1115,7 @@ async function promptJoin(code) {
 
 async function doJoin(code) {
   if (!isValidJoinCode(code)) {
-    sys("codes start with P- (1:1) or R- (group)");
+    sys("codes start with P- (1:1) or R- (party)");
     return;
   }
   if (isOwnPendingCode(code)) {
@@ -1109,8 +1132,8 @@ async function doJoin(code) {
   if (info.kind === "room") {
     sys(
       info.reachable
-        ? `joining · ${info.members ?? "?"} present`
-        : "joining · host not reached yet"
+        ? `joining party · ${info.members ?? "?"} present`
+        : "joining party · host not reached yet"
     );
   } else {
     sys("connecting…");
@@ -1138,7 +1161,8 @@ async function doJoin(code) {
         live ? "LIVE" : "WAITING",
         { force: true }
       );
-      sys(live ? "group live" : "waiting for others", "ok");
+      sys(live ? "party live" : "waiting for others", "ok");
+      blip("connect");
     }
   } catch (e) {
     sys(humanError(e));
@@ -1611,6 +1635,11 @@ async function boot() {
       await refreshLists();
       return;
     }
+    // don't yank out of an open party into a DM
+    if (state.activeKind === "room") {
+      await refreshLists();
+      return;
+    }
     if (state.active === id) {
       await refreshLists();
       return;
@@ -1624,6 +1653,18 @@ async function boot() {
       { force: true }
     );
     await announceLineLive(id, !!ev.payload.verified);
+  });
+
+  await listen("party_join", async (ev) => {
+    await refreshLists();
+    const topic = ev.payload?.topic;
+    if (state.activeKind === "room" && state.active === topic) {
+      const who = ev.payload?.label || short(ev.payload?.endpoint_id || "");
+      const n = roomMemberCount() + 1;
+      sys(`${who || "someone"} joined · ${n}`, "ok");
+      blip("connect");
+      updateStatusBar();
+    }
   });
 
   await listen("conn_path", (ev) => {

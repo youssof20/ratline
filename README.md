@@ -6,7 +6,7 @@ A live private line. Both of you online. No accounts, no cloud inbox, nothing qu
 
 <img src="assets/demo-commands.gif" width="640" alt="commands demo" />
 
-Not a messenger. A walkie-talkie with crypto — you open the line, talk, then it goes quiet.
+Not a messenger. A walkie-talkie with crypto - you open the line, talk, then it goes quiet.
 
 ## Facts
 
@@ -52,17 +52,20 @@ One input line. Enter sends; Shift+Enter is a newline. `Ctrl+\`` summons the win
 
 **Verify:** after pair, fingerprints print. Read them aloud (or text separately from the code). Then `/verify`.
 
-**Later:** `/connect <name>` reconnects a known peer — no new code.
+**Party:** `/party` → share the `R-` code → others `/join` it. Live party line - everyone online at once. `/name` labels it.
+
+**Later:** `/connect <name>` reconnects a known peer - no new code.
 
 ```
 /connect [name]   open a line / reconnect
-/join <code>      enter theirs
+/join <code>      enter theirs (P- or R-)
+/party            open a party line
 /verify           confirm fingerprint out of band
 /go · /who        switch / list
 /leave · /clear   forget chat / clear screen
 /name · /fp       label / show fingerprint
 /file             send while both online
-/help more        groups, seal, hist, …
+/help more        seal, hist, …
 ```
 
 Paste a code → `y/n` before join. Tab completes. Up/Down recalls lines.
@@ -71,7 +74,7 @@ Paste a code → `y/n` before join. Tab completes. Up/Down recalls lines.
 
 - Direct links show your IP to the peer. Relays see connection metadata, not message content.
 - Optional local history uses a key derived from your identity file. Disk access on this machine means full compromise.
-- `/seal` / `/drop` (under `/help more`) are sealed envelopes you hand off yourself — not offline messaging.
+- `/seal` / `/drop` (under `/help more`) are sealed envelopes you hand off yourself - not offline messaging.
 
 ## License
 

@@ -22,6 +22,9 @@ pub struct StoredRoom {
     pub topic_id: String,
     pub label: String,
     pub created_at: i64,
+    /// Comma-separated endpoint hex ids used to rejoin gossip after restart.
+    #[serde(default)]
+    pub bootstrap: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,7 +58,8 @@ impl Storage {
             CREATE TABLE IF NOT EXISTS rooms (
                 topic_id TEXT PRIMARY KEY,
                 label TEXT NOT NULL DEFAULT '',
-                created_at INTEGER NOT NULL
+                created_at INTEGER NOT NULL,
+                bootstrap TEXT NOT NULL DEFAULT ''
             );
             CREATE TABLE IF NOT EXISTS messages (
                 id TEXT PRIMARY KEY,
@@ -79,6 +83,11 @@ impl Storage {
             )?;
             stmt.execute([])?;
         }
+        // older installs: rooms without bootstrap column
+        let _ = conn.execute(
+            "ALTER TABLE rooms ADD COLUMN bootstrap TEXT NOT NULL DEFAULT ''",
+            [],
+        );
         let cipher = ChaCha20Poly1305::new(db_key.into());
         Ok(Self {
             conn: Mutex::new(conn),
@@ -177,23 +186,39 @@ impl Storage {
 
     pub fn upsert_room(&self, room: &StoredRoom) -> Result<()> {
         let conn = self.conn.lock().unwrap();
+        // keep an existing name; refresh bootstrap when provided
         conn.execute(
-            "INSERT INTO rooms(topic_id, label, created_at) VALUES(?1,?2,?3)
-             ON CONFLICT(topic_id) DO UPDATE SET label=excluded.label",
-            params![room.topic_id, room.label, room.created_at],
+            "INSERT INTO rooms(topic_id, label, created_at, bootstrap) VALUES(?1,?2,?3,?4)
+             ON CONFLICT(topic_id) DO UPDATE SET
+               bootstrap=CASE
+                 WHEN excluded.bootstrap != '' THEN excluded.bootstrap
+                 ELSE rooms.bootstrap
+               END",
+            params![room.topic_id, room.label, room.created_at, room.bootstrap],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_room_bootstrap(&self, topic_id: &str, bootstrap: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE rooms SET bootstrap=?1 WHERE topic_id=?2",
+            params![bootstrap, topic_id],
         )?;
         Ok(())
     }
 
     pub fn list_rooms(&self) -> Result<Vec<StoredRoom>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt =
-            conn.prepare("SELECT topic_id, label, created_at FROM rooms ORDER BY created_at")?;
+        let mut stmt = conn.prepare(
+            "SELECT topic_id, label, created_at, bootstrap FROM rooms ORDER BY created_at",
+        )?;
         let rows = stmt.query_map([], |r| {
             Ok(StoredRoom {
                 topic_id: r.get(0)?,
                 label: r.get(1)?,
                 created_at: r.get(2)?,
+                bootstrap: r.get::<_, String>(3).unwrap_or_default(),
             })
         })?;
         Ok(rows.filter_map(|r| r.ok()).collect())
