@@ -5,11 +5,12 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const DEFAULT_HOTKEY: &str = "ctrl+grave";
+/// Valid global-hotkey name for the backtick key (not "grave").
+const DEFAULT_HOTKEY: &str = "ctrl+backquote";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
-    /// Global summon hotkey (Tauri / keyboard crate syntax).
+    /// Global summon hotkey (global-hotkey crate syntax).
     #[serde(default = "default_hotkey")]
     pub hotkey: String,
     /// Soft connect / message tones. Off by default.
@@ -30,6 +31,23 @@ impl Default for Config {
     }
 }
 
+/// Map legacy / friendly names to what global-hotkey accepts.
+pub fn normalize_hotkey(raw: &str) -> String {
+    let s = raw.trim().to_lowercase().replace(' ', "");
+    if s.is_empty() {
+        return DEFAULT_HOTKEY.into();
+    }
+    // old default that panics the plugin: "ctrl+grave"
+    let s = s
+        .replace("+grave", "+backquote")
+        .replace("grave+", "backquote+");
+    if s == "grave" {
+        return "backquote".into();
+    }
+    // allow ctrl+` literally
+    s.replace("+`", "+backquote").replace("`+", "backquote+")
+}
+
 impl Config {
     pub fn path(data_dir: &Path) -> PathBuf {
         data_dir.join("config.json")
@@ -37,10 +55,16 @@ impl Config {
 
     pub fn load(data_dir: &Path) -> Self {
         let path = Self::path(data_dir);
-        match fs::read_to_string(&path) {
+        let mut cfg = match fs::read_to_string(&path) {
             Ok(raw) => serde_json::from_str(&raw).unwrap_or_default(),
             Err(_) => Self::default(),
+        };
+        let normalized = normalize_hotkey(&cfg.hotkey);
+        if normalized != cfg.hotkey {
+            cfg.hotkey = normalized;
+            let _ = cfg.save(data_dir);
         }
+        cfg
     }
 
     pub fn save(&self, data_dir: &Path) -> Result<()> {
@@ -54,4 +78,16 @@ impl Config {
 
 pub fn default_hotkey_str() -> &'static str {
     DEFAULT_HOTKEY
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn migrates_grave_to_backquote() {
+        assert_eq!(normalize_hotkey("ctrl+grave"), "ctrl+backquote");
+        assert_eq!(normalize_hotkey("Ctrl + Grave"), "ctrl+backquote");
+        assert_eq!(normalize_hotkey("ctrl+`"), "ctrl+backquote");
+    }
 }

@@ -85,6 +85,15 @@ function humanError(err) {
   if (/No addressing information|pkarr|TXT record|dns/i.test(s)) {
     return "could not find them - code expired, wrong, or offline";
   }
+  if (/being used|access is denied|os error 32|cannot access the file/i.test(s)) {
+    return "file locked - quit ratline fully, then /update or reinstall";
+  }
+  if (/contact github|failed to fetch|error sending request/i.test(s)) {
+    return "could not reach github - check network";
+  }
+  if (/checksum mismatch/i.test(s)) {
+    return "download corrupt - try /update again";
+  }
   const line = s.split("\n")[0].trim();
   if (/^dial pairing host/i.test(line)) {
     return "could not reach them (code invalid or expired?)";
@@ -753,8 +762,8 @@ async function runCommand(raw) {
         }
         state.updateDeadline = 0;
         try {
+          sys("closing to install · app will reopen", "ok");
           await invoke("run_update");
-          sys("installer launched · restarting", "ok");
         } catch (e) {
           clearProgress();
           sys(humanError(e));

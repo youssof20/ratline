@@ -103,7 +103,7 @@ fn find_sums_asset(assets: &[GhAsset]) -> Result<&GhAsset> {
     assets
         .iter()
         .find(|a| a.name.eq_ignore_ascii_case("SHA256SUMS") || a.name.ends_with("SHA256SUMS.txt"))
-        .ok_or_else(|| anyhow!("release has no SHA256SUMS — refusing update"))
+        .ok_or_else(|| anyhow!("release has no SHA256SUMS - refusing update"))
 }
 
 async fn fetch_latest() -> Result<GhRelease> {
@@ -131,7 +131,6 @@ fn parse_sha256sums(text: &str) -> HashMap<String, String> {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        // "hash  filename" or "hash *filename"
         let mut parts = line.split_whitespace();
         let Some(hash) = parts.next() else { continue };
         let Some(name) = parts.next() else { continue };
@@ -276,7 +275,7 @@ pub async fn run_update(app: AppHandle) -> Result<()> {
     let got = sha256_file(&dest)?;
     if got != expected {
         let _ = std::fs::remove_file(&dest);
-        bail!("checksum mismatch — update aborted");
+        bail!("checksum mismatch - update aborted");
     }
 
     emit_progress(&app, "install", 100, &from, &to, &name);
@@ -287,17 +286,8 @@ pub async fn run_update(app: AppHandle) -> Result<()> {
 fn apply_and_restart(app: &AppHandle, path: &Path) -> Result<()> {
     #[cfg(target_os = "windows")]
     {
-        let path_str = path.to_string_lossy().to_string();
-        if path_str.ends_with(".msi") {
-            std::process::Command::new("msiexec")
-                .args(["/i", &path_str])
-                .spawn()
-                .context("launch msi")?;
-        } else {
-            std::process::Command::new(&path_str)
-                .spawn()
-                .context("launch installer")?;
-        }
+        schedule_windows_replace(path)?;
+        // exit after helper is running so the installer can overwrite ratline.exe
         app.exit(0);
         Ok(())
     }
@@ -348,4 +338,87 @@ fn apply_and_restart(app: &AppHandle, path: &Path) -> Result<()> {
         let _ = (app, path);
         bail!("unsupported platform")
     }
+}
+
+/// Wait until this process exits, then silent-install and relaunch.
+/// Avoids "file is being used" when the installer tries to replace ratline.exe.
+#[cfg(target_os = "windows")]
+fn schedule_windows_replace(installer: &Path) -> Result<()> {
+    use std::os::windows::process::CommandExt;
+
+    let exe = std::env::current_exe().context("current exe")?;
+    let pid = std::process::id();
+    let dir = std::env::temp_dir().join("ratline-update");
+    std::fs::create_dir_all(&dir)?;
+
+    // Keep a stable copy the helper owns (installer path may be same folder).
+    let setup = dir.join(format!(
+        "pending-{}",
+        installer
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("setup.exe")
+    ));
+    if setup != installer {
+        std::fs::copy(installer, &setup).context("stage installer")?;
+    }
+
+    let script = dir.join("apply.cmd");
+    let setup_s = setup.to_string_lossy().replace('/', "\\");
+    let exe_s = exe.to_string_lossy().replace('/', "\\");
+    let log_s = dir.join("apply.log").to_string_lossy().replace('/', "\\");
+
+    let is_msi = setup_s.to_ascii_lowercase().ends_with(".msi");
+    let install_line = if is_msi {
+        format!(
+            "msiexec /i \"{setup_s}\" /qn /norestart REBOOT=ReallySuppress >> \"{log_s}\" 2>&1"
+        )
+    } else {
+        // NSIS silent; /S is case-sensitive for NSIS
+        format!("\"{setup_s}\" /S >> \"{log_s}\" 2>&1")
+    };
+
+    let body = format!(
+        r#"@echo off
+setlocal EnableExtensions
+echo ratline update helper started %DATE% %TIME% > "{log_s}"
+echo waiting for pid {pid} >> "{log_s}"
+:wait
+tasklist /FI "PID eq {pid}" 2>NUL | find "{pid}" >NUL
+if not errorlevel 1 (
+  timeout /t 1 /nobreak >NUL
+  goto wait
+)
+rem extra beat so Windows releases the exe handle
+timeout /t 2 /nobreak >NUL
+rem clear any leftover ratline processes that could lock the file
+taskkill /F /IM ratline.exe /T >NUL 2>&1
+timeout /t 1 /nobreak >NUL
+echo installing >> "{log_s}"
+{install_line}
+set ERR=%ERRORLEVEL%
+echo installer exit %ERR% >> "{log_s}"
+timeout /t 1 /nobreak >NUL
+if exist "{exe_s}" (
+  echo launching >> "{log_s}"
+  start "" "{exe_s}"
+) else (
+  echo missing exe after install >> "{log_s}"
+)
+endlocal
+"#
+    );
+    std::fs::write(&script, body).context("write update helper")?;
+
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+
+    std::process::Command::new("cmd.exe")
+        .args(["/C", &script.to_string_lossy()])
+        .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
+        .spawn()
+        .context("start update helper")?;
+
+    Ok(())
 }

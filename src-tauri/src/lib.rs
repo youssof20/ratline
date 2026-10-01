@@ -17,7 +17,6 @@ use app::{App, CodeInspect, PeerInfo, RoomInfo, StatusSnapshot, UiMessage};
 use cli::{DemoKind, DemoRole, LaunchArgs};
 use serde::Serialize;
 use tauri::Manager;
-use tauri_plugin_global_shortcut::ShortcutState;
 
 fn default_data_dir() -> PathBuf {
     dirs::data_dir()
@@ -27,10 +26,58 @@ fn default_data_dir() -> PathBuf {
 
 fn map_err(e: anyhow::Error) -> String {
     let s = format!("{e:#}");
-    if s.to_lowercase().contains("ourself") {
+    let lower = s.to_lowercase();
+    if lower.contains("ourself") {
         return "that's your own code - give it to someone else".into();
     }
+    if lower.contains("being used")
+        || lower.contains("access is denied")
+        || lower.contains("os error 32")
+        || lower.contains("os error 5")
+    {
+        return "file locked - close ratline and try /update again (or reinstall from github)".into();
+    }
     s.lines().next().unwrap_or(&s).to_string()
+}
+
+#[cfg(windows)]
+fn show_fatal(title: &str, msg: &str) {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    #[link(name = "user32")]
+    extern "system" {
+        fn MessageBoxW(
+            hwnd: *mut core::ffi::c_void,
+            text: *const u16,
+            caption: *const u16,
+            flags: u32,
+        ) -> i32;
+    }
+    fn wide(s: &str) -> Vec<u16> {
+        OsStr::new(s).encode_wide().chain(Some(0)).collect()
+    }
+    let t = wide(title);
+    let m = wide(msg);
+    unsafe {
+        MessageBoxW(std::ptr::null_mut(), m.as_ptr(), t.as_ptr(), 0x10);
+    }
+}
+
+#[cfg(not(windows))]
+fn show_fatal(title: &str, msg: &str) {
+    eprintln!("{title}: {msg}");
+}
+
+fn write_crash_log(data_dir: &std::path::Path, msg: &str) {
+    let _ = std::fs::create_dir_all(data_dir);
+    let path = data_dir.join("crash.log");
+    let stamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+    let body = format!("[{stamp}] {msg}\n");
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .and_then(|mut f| std::io::Write::write_all(&mut f, body.as_bytes()));
 }
 
 #[derive(Clone, Serialize)]
@@ -178,7 +225,8 @@ async fn set_hotkey(
     app: tauri::AppHandle,
     hotkey: String,
 ) -> Result<String, String> {
-    let hk = state.set_hotkey(&hotkey).map_err(map_err)?;
+    let normalized = config::normalize_hotkey(&hotkey);
+    let hk = state.set_hotkey(&normalized).map_err(map_err)?;
     desktop::reregister_hotkey(&app, &hk)?;
     Ok(hk)
 }
@@ -410,30 +458,58 @@ pub fn run_with_args(args: LaunchArgs) {
     let boot_cfg = config::Config::load(&data);
     let hotkey = boot_cfg.hotkey.clone();
     let args_managed = args.clone();
+    let data_for_setup = data.clone();
 
-    tauri::Builder::default()
+    let result = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
-        .plugin(
-            tauri_plugin_global_shortcut::Builder::new()
-                .with_shortcuts([hotkey.as_str()])
-                .expect("hotkey")
-                .with_handler(|app, _shortcut, event| {
-                    if event.state == ShortcutState::Pressed {
-                        let _ = desktop::toggle_summon(app);
-                    }
-                })
-                .build(),
-        )
+        // register hotkey in setup — never panic the process over a bad chord
+        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .manage(args_managed)
         .setup(move |app| {
             if let Some(w) = app.get_webview_window("main") {
                 let _ = w.set_title(window_title);
             }
             let handle = app.handle().clone();
-            desktop::setup_tray_and_close(&handle)?;
-            let state = tauri::async_runtime::block_on(App::bootstrap(data))
-                .expect("bootstrap ratline");
+            if let Err(e) = desktop::setup_tray_and_close(&handle) {
+                tracing::warn!("tray setup: {e}");
+            }
+
+            let mut active_hotkey = hotkey.clone();
+            if let Err(e) = desktop::reregister_hotkey(&handle, &active_hotkey) {
+                tracing::warn!("hotkey '{active_hotkey}' failed: {e}");
+                active_hotkey = config::default_hotkey_str().into();
+                if let Err(e2) = desktop::reregister_hotkey(&handle, &active_hotkey) {
+                    tracing::warn!("default hotkey also failed: {e2}");
+                } else {
+                    // persist the working default so next launch is clean
+                    let mut cfg = config::Config::load(&data_for_setup);
+                    cfg.hotkey = active_hotkey.clone();
+                    let _ = cfg.save(&data_for_setup);
+                }
+            }
+
+            let state = match tauri::async_runtime::block_on(App::bootstrap(data_for_setup.clone()))
+            {
+                Ok(s) => s,
+                Err(e) => {
+                    let msg = format!("{e:#}");
+                    write_crash_log(&data_for_setup, &msg);
+                    show_fatal(
+                        "ratline failed to start",
+                        &format!("{msg}\n\nDetails written to:\n{}", data_for_setup.join("crash.log").display()),
+                    );
+                    return Err(msg.into());
+                }
+            };
+            // keep config hotkey in sync with what we registered
+            {
+                let mut cfg = state.config.lock();
+                if cfg.hotkey != active_hotkey {
+                    cfg.hotkey = active_hotkey;
+                    let _ = cfg.save(&state.data_dir);
+                }
+            }
             state.set_app_handle(handle);
             app.manage(state);
             Ok(())
@@ -475,6 +551,11 @@ pub fn run_with_args(args: LaunchArgs) {
             check_update,
             run_update,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running ratline");
+        .run(tauri::generate_context!());
+
+    if let Err(e) = result {
+        let msg = format!("{e}");
+        write_crash_log(&data, &msg);
+        show_fatal("ratline failed to start", &msg);
+    }
 }

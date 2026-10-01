@@ -1084,10 +1084,11 @@ impl App {
     }
 
     pub fn set_hotkey(&self, hotkey: &str) -> Result<String> {
+        let normalized = crate::config::normalize_hotkey(hotkey);
         let mut cfg = self.config.lock();
-        cfg.hotkey = hotkey.to_string();
+        cfg.hotkey = normalized.clone();
         cfg.save(&self.data_dir)?;
-        Ok(cfg.hotkey.clone())
+        Ok(normalized)
     }
 
     pub fn fingerprint_self(&self) -> String {
