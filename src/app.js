@@ -5,14 +5,15 @@ const COMMANDS = [
   "/help",
   "/connect",
   "/join",
-  "/room",
   "/go",
   "/who",
   "/clear",
   "/leave",
   "/name",
   "/fp",
+  "/verify",
   "/file",
+  "/room",
   "/seal",
   "/drop",
   "/hist",
@@ -222,7 +223,12 @@ function updateStatusBar() {
   }
   const tag = state.activeKind === "room" ? "group" : "dm";
   const name = state.activeLabel || short(state.active);
-  $("status-conv").textContent = `${tag}:${name}`;
+  let mark = "";
+  if (state.activeKind === "peer") {
+    const p = state.peers.find((x) => x.endpoint_id === state.active);
+    if (p?.verified) mark = " · ok";
+  }
+  $("status-conv").textContent = `${tag}:${name}${mark}`;
   updatePlaceholder();
 }
 
@@ -286,7 +292,7 @@ function sys(text, cls) {
     kind = "err";
   } else if (
     !kind &&
-    /copied|connected|direct|joined|named |history on|erased|line live|group live|up to date|sealed envelope|sound |hotkey |forgotten/i.test(
+    /copied|connected|direct|joined|named |history on|erased|line live|group live|verified|up to date|sealed envelope|sound |hotkey |forgotten/i.test(
       t
     )
   ) {
@@ -440,7 +446,7 @@ function showIdle(mode = "home") {
   if (mode === "home") {
     const a = document.createElement("div");
     a.className = "idle-hint";
-    a.textContent = "one line. encrypted.";
+    a.textContent = "both online. one line.";
     log.appendChild(a);
     const b = document.createElement("div");
     b.className = "idle-hint";
@@ -449,12 +455,12 @@ function showIdle(mode = "home") {
   } else if (mode === "chat") {
     const a = document.createElement("div");
     a.className = "idle-hint";
-    a.textContent = "quiet";
+    a.textContent = "line open";
     log.appendChild(a);
   } else if (mode === "waiting") {
     const a = document.createElement("div");
     a.className = "idle-hint";
-    a.textContent = "waiting…";
+    a.textContent = "waiting for them…";
     log.appendChild(a);
   }
 }
@@ -469,7 +475,7 @@ async function refreshLists() {
   if (fpEl) {
     fpEl.textContent = state.fingerprint || "····";
     fpEl.title = state.fingerprint
-      ? "fingerprint — verify out of band · click to copy"
+      ? "fingerprint · verify out of band · click to copy"
       : "fingerprint";
   }
   state.pendingCode = status.pairing_code || null;
@@ -487,6 +493,7 @@ async function refreshLists() {
     } else if (p && was && !was.connected && p.connected) {
       sys("line live", "ok");
       blip("connect");
+      if (!p.verified) sys("unverified · /verify when you can");
     } else if (p) {
       state.activeLabel = p.label || short(p.endpoint_id);
       setPath(p.connected ? (p.path || "").toUpperCase() : "OFFLINE");
@@ -629,7 +636,11 @@ function listWho() {
     const kindLabel = c.kind === "room" ? "group" : "dm";
     const extra = c.kind === "room" ? ` · ${c.members ?? 0}` : "";
     sys(
-      `${i + 1}. ${kindLabel} ${c.label}  ${prettyPath(c.path)}${extra}  ${short(c.id)}`
+      `${i + 1}. ${kindLabel} ${c.label}  ${prettyPath(c.path)}${extra}${
+        c.kind === "peer" && state.peers.find((p) => p.endpoint_id === c.id)?.verified
+          ? " · ok"
+          : ""
+      }  ${short(c.id)}`
     );
   });
 }
@@ -698,17 +709,18 @@ async function runCommand(raw) {
     case "/help": {
       if (args[0] === "more" || args[0] === "all") {
         sys("<?>", "help");
-        sys("/seal <peer> <msg>  ·  /seal <peer> @ <file>  handoff envelope");
-        sys("/drop <path>  open sealed file for you");
-        sys("/hist on|off  ·  /wipe  local history (10s confirm)");
-        sys("/burn  wipe identity + exit (15s confirm)");
+        sys("/room  group code (live only · both online)");
+        sys("/seal /drop  sealed envelope handoff · not a mailbox");
+        sys("/hist on|off  ·  /wipe  ·  /burn");
         sys("/cancel  revoke pairing code");
         sys("/sound on|off  ·  /hotkey [chord]");
         sys("/update  ·  /version  ·  /quit");
         break;
       }
       sys("<?>", "help");
-      sys("/connect · /join · /room");
+      sys("live line · both must be online");
+      sys("/connect  P- code  ·  /connect <name>  known peer");
+      sys("/join <code>  ·  /verify  after pair");
       sys("/go · /who · /leave · /clear · /name · /fp · /file");
       sys("/help more");
       break;
@@ -786,14 +798,14 @@ async function runCommand(raw) {
           p.path,
           { force: true }
         );
-        sys("line live", "ok");
-        blip("connect");
+        await announceLineLive(p.endpoint_id, !!p.verified);
       } catch (e) {
         sys(humanError(e));
       }
       break;
     }
     case "/room": {
+      sys("group · live only · both sides online");
       const [code, topic] = await invoke("start_room");
       await refreshLists();
       sysValue("code  ", code);
@@ -962,7 +974,7 @@ async function runCommand(raw) {
           body,
           dest,
         });
-        sys("sealed envelope · hand off yourself — not offline messaging", "ok");
+        sys("sealed envelope · hand off yourself · not offline messaging", "ok");
         sysValue("sealed  ", written, "", "sealed envelope · click to copy path");
       } catch (e) {
         sys(humanError(e));
@@ -1010,6 +1022,23 @@ async function runCommand(raw) {
       }
       break;
     }
+    case "/verify": {
+      if (!state.active || state.activeKind !== "peer") {
+        sys("open a dm first · /go or /connect");
+        break;
+      }
+      try {
+        await invoke("set_verified", {
+          endpointId: state.active,
+          verified: true,
+        });
+        await refreshLists();
+        sys("verified · out of band match", "ok");
+      } catch (e) {
+        sys(humanError(e));
+      }
+      break;
+    }
     case "/sound": {
       const mode = (args[0] || "").toLowerCase();
       if (mode !== "on" && mode !== "off") {
@@ -1024,7 +1053,7 @@ async function runCommand(raw) {
     }
     case "/hotkey": {
       if (!args.length) {
-        sys(`hotkey  ${state.hotkey || "—"}`);
+        sys(`hotkey  ${state.hotkey || "-"}`);
         break;
       }
       try {
@@ -1098,8 +1127,7 @@ async function doJoin(code) {
         p.path,
         { force: true }
       );
-      sys("line live", "ok");
-      blip("connect");
+      await announceLineLive(p.endpoint_id, !!p.verified);
     } else {
       const r = result.room;
       const live = (r.members || []).length > 0;
@@ -1114,6 +1142,24 @@ async function doJoin(code) {
     }
   } catch (e) {
     sys(humanError(e));
+  }
+}
+
+async function announceLineLive(peerId, alreadyVerified) {
+  sys("line live", "ok");
+  blip("connect");
+  if (alreadyVerified) {
+    sys("verified", "ok");
+    return;
+  }
+  try {
+    const mine = await invoke("fingerprint", { who: null });
+    const theirs = await invoke("peer_fingerprint", { endpointId: peerId });
+    sysValue("you   ", mine);
+    sysValue("them  ", theirs);
+    sys("read aloud · then /verify");
+  } catch {
+    sys("compare /fp · then /verify");
   }
 }
 
@@ -1209,7 +1255,7 @@ async function onSubmit() {
   }
 
   if (!state.active) {
-    sys("no line yet - /connect /join /room");
+    sys("no line yet - /connect /join");
     return;
   }
   try {
@@ -1552,8 +1598,6 @@ async function boot() {
       sysProgress("verifying…");
     } else if (p.phase === "connected") {
       clearProgress();
-      sys("connected", "ok");
-      blip("connect");
     }
   });
 
@@ -1579,8 +1623,7 @@ async function boot() {
       ev.payload.path || "DIRECT",
       { force: true }
     );
-    sys("line live", "ok");
-    blip("connect");
+    await announceLineLive(id, !!ev.payload.verified);
   });
 
   await listen("conn_path", (ev) => {

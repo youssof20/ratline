@@ -195,6 +195,29 @@ async fn fingerprint(
 }
 
 #[tauri::command]
+async fn set_verified(
+    state: tauri::State<'_, Arc<App>>,
+    endpoint_id: String,
+    verified: bool,
+) -> Result<(), String> {
+    state.set_verified(&endpoint_id, verified).map_err(map_err)
+}
+
+#[tauri::command]
+async fn peer_fingerprint(
+    state: tauri::State<'_, Arc<App>>,
+    endpoint_id: String,
+) -> Result<String, String> {
+    let mut id = [0u8; 32];
+    let raw = hex::decode(endpoint_id.trim()).map_err(|e| e.to_string())?;
+    if raw.len() != 32 {
+        return Err("bad peer id".into());
+    }
+    id.copy_from_slice(&raw);
+    Ok(crate::codes::fingerprint(&id))
+}
+
+#[tauri::command]
 async fn seal_drop(
     state: tauri::State<'_, Arc<App>>,
     peer: String,
@@ -435,6 +458,8 @@ pub fn run_with_args(args: LaunchArgs) {
             set_sound,
             set_hotkey,
             fingerprint,
+            set_verified,
+            peer_fingerprint,
             seal_drop,
             open_drop,
             save_drop_file,

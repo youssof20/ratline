@@ -53,6 +53,7 @@ pub struct PeerInfo {
     pub label: String,
     pub connected: bool,
     pub path: String,
+    pub verified: bool,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -243,12 +244,16 @@ impl App {
             .map(|p| {
                 let sess = self.peers.get(&p.endpoint_id);
                 PeerInfo {
-                    endpoint_id: p.endpoint_id,
+                    endpoint_id: p.endpoint_id.clone(),
                     label: p.label,
                     connected: sess.is_some(),
                     path: sess
                         .map(|s| s.path.lock().clone())
                         .unwrap_or_else(|| "OFFLINE".into()),
+                    verified: self
+                        .storage
+                        .is_peer_verified(&p.endpoint_id)
+                        .unwrap_or(false),
                 }
             })
             .collect())
@@ -614,11 +619,23 @@ impl App {
             .map(|s| s.path.lock().clone())
             .unwrap_or_else(|| "OFFLINE".into());
         Ok(PeerInfo {
-            endpoint_id: peer.endpoint_id,
+            endpoint_id: peer.endpoint_id.clone(),
             label: peer.label,
             connected,
             path,
+            verified: self
+                .storage
+                .is_peer_verified(&peer.endpoint_id)
+                .unwrap_or(false),
         })
+    }
+
+    pub fn set_verified(&self, endpoint_id: &str, on: bool) -> Result<()> {
+        self.storage.set_peer_verified(endpoint_id, on)
+    }
+
+    pub fn peer_verified(&self, endpoint_id: &str) -> bool {
+        self.storage.is_peer_verified(endpoint_id).unwrap_or(false)
     }
 
     async fn reconnect_known(&self) -> Result<()> {
@@ -712,6 +729,10 @@ impl App {
                 label,
                 connected: true,
                 path: path.lock().clone(),
+                verified: self
+                    .storage
+                    .is_peer_verified(&remote_hex)
+                    .unwrap_or(false),
             },
         );
 
@@ -767,10 +788,11 @@ impl App {
             app.emit(
                 "peer_update",
                 PeerInfo {
-                    endpoint_id: conv,
+                    endpoint_id: conv.clone(),
                     label: String::new(),
                     connected: false,
                     path: "OFFLINE".into(),
+                    verified: app.storage.is_peer_verified(&conv).unwrap_or(false),
                 },
             );
         });
@@ -1511,6 +1533,7 @@ async fn run_pairing_host(
                             label: their.label,
                             connected: false,
                             path: "...".into(),
+                            verified: app.storage.is_peer_verified(&their_hex).unwrap_or(false),
                         });
                         if let Err(e) = app.connect_peer(&their_hex).await {
                             tracing::debug!("post-pair connect: {e:#}");
@@ -1612,10 +1635,11 @@ async fn run_pairing_join(
 
     Ok((
         PeerInfo {
-            endpoint_id: their_hex,
+            endpoint_id: their_hex.clone(),
             label: their.label,
             connected: true,
             path: "...".into(),
+            verified: app.storage.is_peer_verified(&their_hex).unwrap_or(false),
         },
         topic,
     ))

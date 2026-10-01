@@ -282,6 +282,32 @@ impl Storage {
         Ok(())
     }
 
+    pub fn set_peer_verified(&self, endpoint_id: &str, on: bool) -> Result<()> {
+        let key = format!("verified:{endpoint_id}");
+        let conn = self.conn.lock().unwrap();
+        if on {
+            conn.execute(
+                "INSERT INTO settings(key, value) VALUES(?1, '1')
+                 ON CONFLICT(key) DO UPDATE SET value='1'",
+                params![key],
+            )?;
+        } else {
+            conn.execute("DELETE FROM settings WHERE key=?1", params![key])?;
+        }
+        Ok(())
+    }
+
+    pub fn is_peer_verified(&self, endpoint_id: &str) -> Result<bool> {
+        let key = format!("verified:{endpoint_id}");
+        let conn = self.conn.lock().unwrap();
+        let v: Result<String, _> = conn.query_row(
+            "SELECT value FROM settings WHERE key=?1",
+            params![key],
+            |r| r.get(0),
+        );
+        Ok(matches!(v.as_deref(), Ok("1")))
+    }
+
     pub fn purge_all(&self) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute_batch(

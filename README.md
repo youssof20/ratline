@@ -1,20 +1,19 @@
 # Ratline
 
-Peer-to-peer encrypted chat. No accounts, no server, no cloud.
+A live private line. Both of you online. No accounts, no cloud inbox, nothing queued for later.
 
 <img src="assets/demo-conversation.gif" width="640" alt="conversation demo" />
 
 <img src="assets/demo-commands.gif" width="640" alt="commands demo" />
 
-Both people need to be online at the same time. Nothing is queued for later.
+Not a messenger. A walkie-talkie with crypto — you open the line, talk, then it goes quiet.
 
 ## Facts
 
-- No phone number, email, or account. Identity is a local keypair on disk.
+- No phone number, email, or account. Identity is a local keypair on your machine.
 - No app server. Nothing is collected on our side.
+- Both people must be online at the same time. That is the product, not a bug.
 - Source is open. Read it yourself.
-
-Not Signal or Telegram. Those keep messages on servers. This one does not.
 
 ## Download
 
@@ -45,36 +44,34 @@ npm run dev
 ratline --version
 ```
 
-Recording demos (not listed in-app): `ratline --demo conversation` / `ratline --demo commands`.
-
 ## Usage
 
-One input line. Enter sends; Shift+Enter is a newline. `Ctrl+\`` summons the window (tray when hidden).
+One input line. Enter sends; Shift+Enter is a newline. `Ctrl+\`` summons the window (hides to tray).
 
-**1:1:** `/connect` → share the `P-` code → they `/join` it. Later: `/connect <name>`.
+**Open a line:** `/connect` → share the `P-` code → they `/join` it.
 
-**Group:** `/room` → share the `R-` code → others `/join`.
+**Verify:** after pair, fingerprints print. Read them aloud (or text separately from the code). Then `/verify`.
 
-**Verify:** status shows fingerprint `F-····`. Read it out of band. `/fp` / `/fp <name>`.
+**Later:** `/connect <name>` reconnects a known peer — no new code.
 
 ```
-/connect [name]   pair or reconnect
+/connect [name]   open a line / reconnect
 /join <code>      enter theirs
-/room             group code
+/verify           confirm fingerprint out of band
 /go · /who        switch / list
 /leave · /clear   forget chat / clear screen
-/name · /fp       label / fingerprint
+/name · /fp       label / show fingerprint
 /file             send while both online
-/help more        seal, drop, hist, wipe, burn, …
+/help more        groups, seal, hist, …
 ```
 
 Paste a code → `y/n` before join. Tab completes. Up/Down recalls lines.
 
 ## Privacy
 
-- Direct links show your IP to the peer. Relays see metadata, not content.
-- Optional local history uses a key derived from your identity file. Disk access on this machine means full compromise — not “safe if the drive is stolen.”
-- `/seal` / `/drop` are sealed envelopes you hand off yourself. Not offline messaging. Claimed sender is not a signature.
+- Direct links show your IP to the peer. Relays see connection metadata, not message content.
+- Optional local history uses a key derived from your identity file. Disk access on this machine means full compromise.
+- `/seal` / `/drop` (under `/help more`) are sealed envelopes you hand off yourself — not offline messaging.
 
 ## License
 
