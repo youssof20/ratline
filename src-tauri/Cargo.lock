@@ -4858,7 +4858,7 @@ dependencies = [
 
 [[package]]
 name = "ratline"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -4881,6 +4881,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "spake2",
  "tauri",
  "tauri-build",

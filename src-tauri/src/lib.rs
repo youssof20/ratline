@@ -78,32 +78,8 @@ async fn join_code(
 }
 
 #[tauri::command]
-async fn join_pairing(
-    state: tauri::State<'_, Arc<App>>,
-    code: String,
-) -> Result<PeerInfo, String> {
-    state.join_pairing(code).await.map_err(map_err)
-}
-
-#[tauri::command]
 async fn start_room(state: tauri::State<'_, Arc<App>>) -> Result<(String, String), String> {
     state.start_room().await.map_err(map_err)
-}
-
-#[tauri::command]
-async fn join_room(
-    state: tauri::State<'_, Arc<App>>,
-    code: String,
-) -> Result<RoomInfo, String> {
-    state.join_room_code(code).await.map_err(map_err)
-}
-
-#[tauri::command]
-async fn connect_peer(
-    state: tauri::State<'_, Arc<App>>,
-    endpoint_id: String,
-) -> Result<(), String> {
-    state.connect_peer(&endpoint_id).await.map_err(map_err)
 }
 
 #[tauri::command]
@@ -243,6 +219,28 @@ async fn open_drop(
     path: String,
 ) -> Result<crate::drop::OpenedDrop, String> {
     state.open_drop(PathBuf::from(path)).map_err(map_err)
+}
+
+#[tauri::command]
+async fn save_drop_file(
+    state: tauri::State<'_, Arc<App>>,
+    dest: String,
+    bytes: Vec<u8>,
+) -> Result<(), String> {
+    state
+        .save_drop_bytes(PathBuf::from(dest), &bytes)
+        .map_err(map_err)
+}
+
+#[tauri::command]
+async fn cancel_invite(state: tauri::State<'_, Arc<App>>) -> Result<(), String> {
+    state.cancel_invite().map_err(map_err)
+}
+
+#[tauri::command]
+async fn quit_app(app: tauri::AppHandle) -> Result<(), String> {
+    app.exit(0);
+    Ok(())
 }
 
 #[tauri::command]
@@ -424,10 +422,7 @@ pub fn run_with_args(args: LaunchArgs) {
             start_pairing,
             inspect_code,
             join_code,
-            join_pairing,
             start_room,
-            join_room,
-            connect_peer,
             connect_named,
             send_text,
             send_typing,
@@ -442,6 +437,9 @@ pub fn run_with_args(args: LaunchArgs) {
             fingerprint,
             seal_drop,
             open_drop,
+            save_drop_file,
+            cancel_invite,
+            quit_app,
             set_label,
             leave_conversation,
             pick_file,

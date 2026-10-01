@@ -1,13 +1,13 @@
 :root {
-  --bg: #060806;
-  --bg-deep: #020302;
-  --fg: #7dff9a;
-  --fg-soft: #4fcf6e;
-  --dim: #3d7a4a;
-  --dimmer: #1a3d24;
-  --warn: #d4a017;
-  --danger: #e85a4a;
-  --relay: #8fb89a;
+  --bg: #070908;
+  --bg-deep: #030403;
+  --fg: #9bc4a4;
+  --fg-soft: #6f9a78;
+  --dim: #4a6b52;
+  --dimmer: #24382a;
+  --warn: #c4a35a;
+  --danger: #c96b5c;
+  --relay: #7a9a82;
   --s1: 4px;
   --s2: 8px;
   --s3: 16px;
@@ -32,7 +32,7 @@ html, body {
 }
 
 ::selection {
-  background: rgba(125, 255, 154, 0.2);
+  background: rgba(155, 196, 164, 0.22);
   color: #fff;
 }
 
@@ -176,22 +176,11 @@ body::after {
   app-region: no-drag;
 }
 
-#short-id {
-  font-size: 12px;
-  letter-spacing: 0.04em;
-  cursor: pointer;
-  transition: color var(--dur) var(--ease);
-}
-
-#short-id:hover {
-  color: var(--fg-soft);
-}
-
 .fp {
   font-size: 11px;
   letter-spacing: 0.06em;
   cursor: pointer;
-  opacity: 0.85;
+  opacity: 0.9;
 }
 
 .fp:hover {

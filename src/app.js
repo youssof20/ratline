@@ -1,6 +1,5 @@
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
-const { getCurrentWebviewWindow } = window.__TAURI__.webviewWindow;
 
 const COMMANDS = [
   "/help",
@@ -10,22 +9,24 @@ const COMMANDS = [
   "/go",
   "/who",
   "/clear",
-  "/wipe",
-  "/burn",
-  "/name",
-  "/hist",
   "/leave",
+  "/name",
+  "/fp",
   "/file",
   "/seal",
   "/drop",
-  "/fp",
-  "/fingerprint",
+  "/hist",
+  "/wipe",
+  "/burn",
+  "/cancel",
   "/sound",
   "/hotkey",
   "/update",
   "/version",
-  "/demo",
+  "/quit",
 ];
+
+const TYPEWRITER_MAX = 80;
 
 const state = {
   active: null,
@@ -36,12 +37,12 @@ const state = {
   path: "",
   wipeDeadline: 0,
   burnDeadline: 0,
+  updateDeadline: 0,
   codeTimer: null,
   lastCode: null,
   pendingCode: null,
   pendingJoin: null,
   lastCopiedCode: null,
-  myShort: "",
   myId: "",
   fingerprint: "",
   sound: false,
@@ -285,7 +286,7 @@ function sys(text, cls) {
     kind = "err";
   } else if (
     !kind &&
-    /copied|connected|direct|joined|named |history on|erased|line live|group live|up to date|sealed envelope|sound |hotkey /i.test(
+    /copied|connected|direct|joined|named |history on|erased|line live|group live|up to date|sealed envelope|sound |hotkey |forgotten/i.test(
       t
     )
   ) {
@@ -349,6 +350,27 @@ function msgPrefix(cls, meta) {
   return cls === "out" ? "> " : "< ";
 }
 
+function attachLiveFileClick(line, body, meta) {
+  line.style.cursor = "pointer";
+  line.title = "available while both online";
+  line.onclick = async () => {
+    const m = body.match(/FILE (.+) \((\d+)b\) (.+)$/);
+    if (!m) return;
+    const dest = await invoke("pick_save", { defaultName: m[1] });
+    if (!dest) return;
+    try {
+      await invoke("download_file", {
+        fromEndpoint: meta.sender_id,
+        hash: m[3],
+        dest,
+      });
+      sys(`saved ${m[1]}`, "ok");
+    } catch (e) {
+      sys(humanError(e));
+    }
+  };
+}
+
 function appendMsg(body, cls, opts = {}, meta) {
   if (!opts || typeof opts !== "object") opts = {};
   const log = $("log");
@@ -358,28 +380,16 @@ function appendMsg(body, cls, opts = {}, meta) {
   line.className = `line ${cls}${opts.hist ? " hist" : ""}`;
   log.appendChild(line);
 
-  if (meta?.kind === "file") {
-    line.style.cursor = "pointer";
-    line.title = "click to save";
-    line.onclick = async () => {
-      const m = body.match(/FILE (.+) \((\d+)b\) (.+)$/);
-      if (!m) return;
-      const dest = await invoke("pick_save", { defaultName: m[1] });
-      if (!dest) return;
-      try {
-        await invoke("download_file", {
-          fromEndpoint: meta.sender_id,
-          hash: m[3],
-          dest,
-        });
-        sys(`saved ${m[1]}`, "ok");
-      } catch (e) {
-        sys(humanError(e));
-      }
-    };
+  const isLiveFile =
+    meta?.kind === "file" &&
+    !opts.hist &&
+    cls === "in" &&
+    (opts.live || !opts.hist);
+  if (isLiveFile) {
+    attachLiveFileClick(line, body, meta);
   }
 
-  line.textContent = msgPrefix(cls, meta) + body;
+  line.appendChild(document.createTextNode(msgPrefix(cls, meta) + body));
   log.scrollTop = log.scrollHeight;
 }
 
@@ -390,29 +400,17 @@ async function appendMsgLive(body, cls, meta) {
   line.className = `line ${cls}`;
   log.appendChild(line);
 
-  if (meta?.kind === "file") {
-    line.style.cursor = "pointer";
-    line.title = "click to save";
-    line.onclick = async () => {
-      const m = body.match(/FILE (.+) \((\d+)b\) (.+)$/);
-      if (!m) return;
-      const dest = await invoke("pick_save", { defaultName: m[1] });
-      if (!dest) return;
-      try {
-        await invoke("download_file", {
-          fromEndpoint: meta.sender_id,
-          hash: m[3],
-          dest,
-        });
-        sys(`saved ${m[1]}`, "ok");
-      } catch (e) {
-        sys(humanError(e));
-      }
-    };
+  if (meta?.kind === "file" && cls === "in") {
+    attachLiveFileClick(line, body, meta);
+    line.appendChild(document.createTextNode(msgPrefix(cls, meta) + body));
+    log.scrollTop = log.scrollHeight;
+    return;
   }
 
   const prefix = msgPrefix(cls, meta);
-  if (reduceMotion() || meta?.kind === "file") {
+  const instant = reduceMotion() || body.length > TYPEWRITER_MAX;
+
+  if (instant) {
     line.textContent = prefix + body;
     log.scrollTop = log.scrollHeight;
     return;
@@ -464,11 +462,9 @@ function showIdle(mode = "home") {
 async function refreshLists() {
   const status = await invoke("get_status");
   state.myId = status.endpoint_id || "";
-  state.myShort = status.short_id || "";
   state.fingerprint = status.fingerprint || "";
   state.sound = !!status.sound;
   state.hotkey = status.hotkey || "";
-  $("short-id").textContent = state.myShort || "····";
   const fpEl = $("fingerprint");
   if (fpEl) {
     fpEl.textContent = state.fingerprint || "····";
@@ -658,8 +654,7 @@ function normalizeCommand(cmd) {
     "/u": "/update",
     "/v": "/version",
     "/f": "/fp",
-    "/b": "/burn",
-    "/s": "/sound",
+    "/s": "/seal",
     "/?": "/help",
   };
   return map[cmd] || cmd;
@@ -688,6 +683,10 @@ function parseSealArgs(line) {
   return { peer, kind: "text", body: rest };
 }
 
+const HIST_STATUS_ON =
+  "history on · local (key = identity; disk access = full compromise)";
+const HIST_STATUS_OFF = "history off · nothing new kept";
+
 async function runCommand(raw) {
   const line = raw.trim();
   const parts = line.split(/\s+/);
@@ -699,27 +698,19 @@ async function runCommand(raw) {
     case "/help": {
       if (args[0] === "more" || args[0] === "all") {
         sys("<?>", "help");
-        sys("/connect  P- pairing  ·  /connect <name>  reconnect known");
-        sys("/room  R- group code");
-        sys("/join <code>");
-        sys("/go <n|name>  ·  /who  list");
-        sys("/clear  screen  ·  /wipe  local history (10s confirm)");
-        sys("/burn  wipe identity + exit (15s confirm)");
-        sys("/name <label>  ·  /hist on|off");
-        sys("/leave  disconnect current");
-        sys("/file [path]  send in chat");
         sys("/seal <peer> <msg>  ·  /seal <peer> @ <file>  handoff envelope");
         sys("/drop <path>  open sealed file for you");
-        sys("/fp [peer]  fingerprint  ·  verify out of band");
+        sys("/hist on|off  ·  /wipe  local history (10s confirm)");
+        sys("/burn  wipe identity + exit (15s confirm)");
+        sys("/cancel  revoke pairing code");
         sys("/sound on|off  ·  /hotkey [chord]");
-        sys("/update  ·  /version");
-        sys("/demo [1|2]  scripted run");
+        sys("/update  ·  /version  ·  /quit");
         break;
       }
       sys("<?>", "help");
-      sys("/connect  P- code  ·  /connect <name>  known peer");
-      sys("/room  R- group  ·  /join <code>");
-      sys("/go · /who · /clear  ·  /help more");
+      sys("/connect · /join · /room");
+      sys("/go · /who · /leave · /clear · /name · /fp · /file");
+      sys("/help more");
       break;
     }
     case "/version": {
@@ -728,6 +719,21 @@ async function runCommand(raw) {
       break;
     }
     case "/update": {
+      if (args[0] === "confirm") {
+        if (Date.now() > state.updateDeadline) {
+          sys("update expired - /update again");
+          break;
+        }
+        state.updateDeadline = 0;
+        try {
+          await invoke("run_update");
+          sys("installer launched · restarting", "ok");
+        } catch (e) {
+          clearProgress();
+          sys(humanError(e));
+        }
+        break;
+      }
       try {
         const info = await invoke("check_update");
         if (!info.available) {
@@ -736,11 +742,23 @@ async function runCommand(raw) {
         }
         sysValue("update  ", `${info.current} → ${info.latest}`);
         if (info.notes) sys(info.notes.slice(0, 120));
-        sys("downloading…");
-        await invoke("run_update");
-        sys("installer launched · restarting", "ok");
+        state.updateDeadline = Date.now() + 15000;
+        sys("confirm: /update confirm  (15s)");
       } catch (e) {
-        clearProgress();
+        sys(humanError(e));
+      }
+      break;
+    }
+    case "/quit": {
+      await invoke("quit_app");
+      break;
+    }
+    case "/cancel": {
+      try {
+        await invoke("cancel_invite");
+        clearCodeTimer();
+        sys("invite cancelled", "ok");
+      } catch (e) {
         sys(humanError(e));
       }
       break;
@@ -748,15 +766,6 @@ async function runCommand(raw) {
     case "/clear": {
       clearScreen();
       showIdle(state.active ? "chat" : "home");
-      break;
-    }
-    case "/demo": {
-      const which = args[0] || "1";
-      const kind =
-        which === "2" || which === "commands" || which === "cmd"
-          ? "commands"
-          : "conversation";
-      await runDemo(kind, "host");
       break;
     }
     case "/connect": {
@@ -836,12 +845,12 @@ async function runCommand(raw) {
       const mode = (args[0] || "").toLowerCase();
       if (mode !== "on" && mode !== "off") {
         const s = await invoke("get_status");
-        sys(`history ${s.history_enabled ? "on" : "off"} · local, encrypted`);
+        sys(s.history_enabled ? HIST_STATUS_ON : HIST_STATUS_OFF);
         break;
       }
       const on = mode === "on";
       await invoke("set_history", { enabled: on });
-      sys(on ? "history on · local, encrypted" : "history off · nothing new kept");
+      sys(on ? HIST_STATUS_ON : HIST_STATUS_OFF);
       break;
     }
     case "/wipe": {
@@ -886,15 +895,14 @@ async function runCommand(raw) {
         break;
       }
       const id = state.active;
-      const label = state.activeLabel || short(id);
       await invoke("leave_conversation", { conversationId: id });
-      sys(`left ${label}`);
       state.active = null;
       state.activeKind = null;
       state.activeLabel = null;
       updateStatusBar();
       clearScreen();
       showIdle("home");
+      sys("left · forgotten", "ok");
       break;
     }
     case "/file": {
@@ -962,28 +970,37 @@ async function runCommand(raw) {
       break;
     }
     case "/drop": {
-      if (!rest) {
-        sys("usage: /drop <path>");
+      let path = rest;
+      if (!path) {
+        path = await invoke("pick_file");
+      }
+      if (!path) {
+        sys("cancelled");
         break;
       }
       try {
-        const opened = await invoke("open_drop", { path: rest });
+        const opened = await invoke("open_drop", { path });
+        sys("sealed envelope · sender claimed, not proven");
         if (opened.kind === "text" && opened.body_text != null) {
-          sys(`drop · text · from ${short(opened.sender)}`);
           appendMsg(opened.body_text, "in", {}, { kind: "text" });
         } else {
-          const bytes = opened.body_bytes?.length ?? 0;
-          sys(
-            `drop · ${opened.kind} · ${opened.name} · ${bytes}b · from ${short(opened.sender)}`
-          );
+          const dest = await invoke("pick_save", { defaultName: opened.name });
+          if (!dest) {
+            sys("cancelled");
+            break;
+          }
+          await invoke("save_drop_file", {
+            dest,
+            bytes: opened.body_bytes,
+          });
+          sys(`saved ${opened.name}`, "ok");
         }
       } catch (e) {
         sys(humanError(e));
       }
       break;
     }
-    case "/fp":
-    case "/fingerprint": {
+    case "/fp": {
       try {
         const who = args[0] || null;
         const fp = await invoke("fingerprint", { who });
@@ -1113,6 +1130,29 @@ async function tryWipeConfirm(raw) {
   return true;
 }
 
+async function tryBurnConfirm(raw) {
+  if (!state.burnDeadline || Date.now() > state.burnDeadline) return false;
+  if (raw.trim().toLowerCase() !== "confirm") return false;
+  state.burnDeadline = 0;
+  sys("burning identity…");
+  await invoke("burn_identity");
+  return true;
+}
+
+async function tryUpdateConfirm(raw) {
+  if (!state.updateDeadline || Date.now() > state.updateDeadline) return false;
+  if (raw.trim().toLowerCase() !== "confirm") return false;
+  state.updateDeadline = 0;
+  try {
+    await invoke("run_update");
+    sys("installer launched · restarting", "ok");
+  } catch (e) {
+    clearProgress();
+    sys(humanError(e));
+  }
+  return true;
+}
+
 async function handlePendingJoin(raw) {
   if (!state.pendingJoin) return false;
   const ans = raw.trim().toLowerCase();
@@ -1158,6 +1198,8 @@ async function onSubmit() {
   }
 
   if (await tryWipeConfirm(raw)) return;
+  if (await tryBurnConfirm(raw)) return;
+  if (await tryUpdateConfirm(raw)) return;
 
   const maybe = raw.trim();
   if (isValidJoinCode(maybe)) {
@@ -1395,14 +1437,15 @@ function tabComplete() {
       m === "/name" ||
       m === "/hist" ||
       m === "/file" ||
-      m === "/demo" ||
       m === "/seal" ||
       m === "/drop" ||
       m === "/fp" ||
-      m === "/fingerprint" ||
       m === "/sound" ||
       m === "/hotkey" ||
-      m === "/connect";
+      m === "/connect" ||
+      m === "/update" ||
+      m === "/wipe" ||
+      m === "/burn";
     el.value = m + (needsSpace ? " " : "");
     return true;
   }
@@ -1454,7 +1497,7 @@ async function playBoot() {
     if (appEl) appEl.classList.add("ready");
     return;
   }
-  await sleep(1180);
+  await sleep(700);
   bootEl.classList.add("done");
   appEl.classList.add("ready");
   await sleep(160);
@@ -1487,11 +1530,11 @@ async function boot() {
       return;
     }
     if (m.outgoing) {
-      appendMsg(m.body, "out", false, m);
+      appendMsg(m.body, "out", {}, m);
       return;
     }
-    if (state.demoRunning || reduceMotion()) {
-      appendMsg(m.body, "in", false, m);
+    if (state.demoRunning) {
+      appendMsg(m.body, "in", { live: true }, m);
     } else {
       await appendMsgLive(m.body, "in", m);
     }
@@ -1632,16 +1675,6 @@ async function boot() {
     sys(`join ${trimmed}?  y/n`);
   });
 
-  $("short-id").addEventListener("click", async () => {
-    if (!state.myShort) return;
-    try {
-      await navigator.clipboard.writeText(state.myId || state.myShort);
-      sys("id copied", "ok");
-    } catch {
-      /* ignore */
-    }
-  });
-
   $("fingerprint")?.addEventListener("click", async () => {
     if (!state.fingerprint) return;
     try {
@@ -1653,13 +1686,7 @@ async function boot() {
   });
 
   $("btn-hide")?.addEventListener("click", () => {
-    invoke("hide_window").catch(() => {
-      try {
-        getCurrentWebviewWindow().hide();
-      } catch {
-        /* ignore */
-      }
-    });
+    invoke("hide_window").catch(() => {});
   });
 
   $("composer").onsubmit = (e) => {
@@ -1668,7 +1695,6 @@ async function boot() {
   };
 
   $("input").focus();
-  setInterval(refreshLists, 3000);
 
   try {
     const cfg = await invoke("get_launch_config");

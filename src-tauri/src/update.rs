@@ -1,13 +1,15 @@
 //! GitHub release check + download/apply for in-terminal `/update`.
 
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::fs::File;
-use std::io::Write;
+use std::io::{BufReader, Read, Write};
 use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Emitter};
 
 const REPO: &str = "youssof20/ratline";
@@ -97,6 +99,13 @@ fn pick_asset(assets: &[GhAsset]) -> Result<&GhAsset> {
     }
 }
 
+fn find_sums_asset(assets: &[GhAsset]) -> Result<&GhAsset> {
+    assets
+        .iter()
+        .find(|a| a.name.eq_ignore_ascii_case("SHA256SUMS") || a.name.ends_with("SHA256SUMS.txt"))
+        .ok_or_else(|| anyhow!("release has no SHA256SUMS — refusing update"))
+}
+
 async fn fetch_latest() -> Result<GhRelease> {
     let url = format!("https://api.github.com/repos/{REPO}/releases/latest");
     let client = reqwest::Client::builder()
@@ -113,6 +122,50 @@ async fn fetch_latest() -> Result<GhRelease> {
         bail!("github returned {}", res.status());
     }
     res.json::<GhRelease>().await.context("parse release json")
+}
+
+fn parse_sha256sums(text: &str) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        // "hash  filename" or "hash *filename"
+        let mut parts = line.split_whitespace();
+        let Some(hash) = parts.next() else { continue };
+        let Some(name) = parts.next() else { continue };
+        let name = name.trim_start_matches('*');
+        map.insert(name.to_string(), hash.to_lowercase());
+    }
+    map
+}
+
+async fn download_text(url: &str) -> Result<String> {
+    let client = reqwest::Client::builder()
+        .user_agent(USER_AGENT)
+        .timeout(Duration::from_secs(60))
+        .build()?;
+    let res = client.get(url).send().await.context("download sums")?;
+    if !res.status().is_success() {
+        bail!("checksum download failed: {}", res.status());
+    }
+    Ok(res.text().await?)
+}
+
+fn sha256_file(path: &Path) -> Result<String> {
+    let file = File::open(path).context("open for hash")?;
+    let mut reader = BufReader::new(file);
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hex::encode(hasher.finalize()))
 }
 
 fn emit_progress(
@@ -174,6 +227,14 @@ pub async fn run_update(app: AppHandle) -> Result<()> {
         bail!("already on latest (v{current})");
     }
     let asset = pick_asset(&rel.assets)?;
+    let sums_asset = find_sums_asset(&rel.assets)?;
+    let sums_text = download_text(&sums_asset.browser_download_url).await?;
+    let sums = parse_sha256sums(&sums_text);
+    let expected = sums
+        .get(&asset.name)
+        .cloned()
+        .ok_or_else(|| anyhow!("SHA256SUMS has no entry for {}", asset.name))?;
+
     let url = asset.browser_download_url.clone();
     let name = asset.name.clone();
     let total = asset.size.max(1);
@@ -209,6 +270,14 @@ pub async fn run_update(app: AppHandle) -> Result<()> {
         }
     }
     file.flush()?;
+    drop(file);
+
+    emit_progress(&app, "verify", 100, &from, &to, &name);
+    let got = sha256_file(&dest)?;
+    if got != expected {
+        let _ = std::fs::remove_file(&dest);
+        bail!("checksum mismatch — update aborted");
+    }
 
     emit_progress(&app, "install", 100, &from, &to, &name);
     apply_and_restart(&app, &dest)?;

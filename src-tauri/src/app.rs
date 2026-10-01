@@ -107,11 +107,13 @@ struct PeerSession {
     label: String,
     send: mpsc::UnboundedSender<Vec<u8>>,
     path: Arc<Mutex<String>>,
+    abort: Mutex<Option<tokio::task::AbortHandle>>,
 }
 
 struct RoomSession {
     sender: GossipSender,
     members: Arc<Mutex<HashSet<String>>>,
+    abort: tokio::task::AbortHandle,
 }
 
 pub struct App {
@@ -132,6 +134,12 @@ pub struct App {
 
 impl App {
     pub async fn bootstrap(data_dir: PathBuf) -> Result<Arc<Self>> {
+        // Full wipe requested by prior /burn (db may have been locked mid-burn).
+        if data_dir.join(".burn").exists() {
+            let _ = std::fs::remove_dir_all(&data_dir);
+            std::fs::create_dir_all(&data_dir)?;
+        }
+
         let identity = Identity::load_or_create(&data_dir)?;
         let db_key = storage::db_key_from_identity(&identity.secret.to_bytes());
         let storage = Storage::open(&data_dir, &db_key)?;
@@ -342,7 +350,7 @@ impl App {
                 kind: "peer".into(),
                 summary: "1:1 peer · single-use".into(),
                 members: None,
-                reachable: true,
+                reachable: false,
             }),
             codes::CodeKind::Room => {
                 match preview_room(kind, &body).await {
@@ -504,7 +512,7 @@ impl App {
         let app = app_ref()?;
         let tid = topic_hex.clone();
 
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             while let Some(ev) = receiver.next().await {
                 match ev {
                     Ok(Event::Received(msg)) => {
@@ -537,6 +545,7 @@ impl App {
             RoomSession {
                 sender,
                 members,
+                abort: task.abort_handle(),
             },
         );
         Ok(())
@@ -666,6 +675,7 @@ impl App {
                 label: label.clone(),
                 send: tx,
                 path: path.clone(),
+                abort: Mutex::new(None),
             },
         );
 
@@ -717,7 +727,7 @@ impl App {
         let conv = remote_hex.clone();
         let path_watch = path.clone();
         let endpoint = self.endpoint.clone();
-        tokio::spawn(async move {
+        let session_task = tokio::spawn(async move {
             let path_task = {
                 let path_watch = path_watch.clone();
                 let endpoint = endpoint.clone();
@@ -753,6 +763,7 @@ impl App {
             }
             path_task.abort();
             app.peers.remove(&conv);
+            app.dm_gossip.remove(&conv);
             app.emit(
                 "peer_update",
                 PeerInfo {
@@ -763,6 +774,10 @@ impl App {
                 },
             );
         });
+
+        if let Some(sess) = self.peers.get(&remote_hex) {
+            *sess.abort.lock() = Some(session_task.abort_handle());
+        }
 
         Ok(())
     }
@@ -961,15 +976,20 @@ impl App {
         self.storage.wipe_conversation(conversation_id)
     }
 
-    /// Destroy identity + history. App should exit; next launch is a new person.
+    /// Destroy identity + all local data. App should exit; next launch is a new person.
     pub fn burn_all(&self) -> Result<()> {
         let dir = &self.data_dir;
-        let identity = dir.join("identity.json");
-        let history = dir.join("history.db");
-        let history_wal = dir.join("history.db-wal");
-        let history_shm = dir.join("history.db-shm");
-        for p in [&identity, &history, &history_wal, &history_shm] {
-            let _ = std::fs::remove_file(p);
+        let _ = self.storage.purge_all();
+        // Marker so next boot wipes the dir even if sqlite files stay locked now.
+        let _ = std::fs::write(dir.join(".burn"), b"1");
+        for name in [
+            "identity.json",
+            "config.json",
+            "history.db",
+            "history.db-wal",
+            "history.db-shm",
+        ] {
+            let _ = std::fs::remove_file(dir.join(name));
         }
         Ok(())
     }
@@ -1076,10 +1096,34 @@ impl App {
     }
 
     pub fn leave(&self, conversation_id: &str) -> Result<()> {
-        if self.rooms.remove(conversation_id).is_some() {
+        if let Some((_, room)) = self.rooms.remove(conversation_id) {
+            room.abort.abort();
+            let _ = self.storage.remove_room(conversation_id);
             return Ok(());
         }
-        self.peers.remove(conversation_id);
+        if let Some((_, peer)) = self.peers.remove(conversation_id) {
+            if let Some(h) = peer.abort.lock().take() {
+                h.abort();
+            }
+        }
+        self.dm_gossip.remove(conversation_id);
+        let _ = self.storage.remove_peer(conversation_id);
+        Ok(())
+    }
+
+    /// Cancel pending P-/R- invite code.
+    pub fn cancel_invite(&self) -> Result<()> {
+        if let Some(old) = self.pending.lock().take() {
+            let _ = old.cancel.send(true);
+        }
+        Ok(())
+    }
+
+    pub fn save_drop_bytes(&self, dest: PathBuf, bytes: &[u8]) -> Result<()> {
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&dest, bytes)?;
         Ok(())
     }
 }

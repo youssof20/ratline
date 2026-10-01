@@ -75,7 +75,7 @@ impl Storage {
         )?;
         {
             let mut stmt = conn.prepare(
-                "INSERT OR IGNORE INTO settings(key, value) VALUES('history_enabled', '1')",
+                "INSERT OR IGNORE INTO settings(key, value) VALUES('history_enabled', '0')",
             )?;
             stmt.execute([])?;
         }
@@ -269,6 +269,24 @@ impl Storage {
             params![endpoint_id],
         )?;
         conn.execute("DELETE FROM peers WHERE endpoint_id=?1", params![endpoint_id])?;
+        Ok(())
+    }
+
+    pub fn remove_room(&self, topic_id: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM messages WHERE conversation_id=?1",
+            params![topic_id],
+        )?;
+        conn.execute("DELETE FROM rooms WHERE topic_id=?1", params![topic_id])?;
+        Ok(())
+    }
+
+    pub fn purge_all(&self) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute_batch(
+            "DELETE FROM messages; DELETE FROM peers; DELETE FROM rooms;",
+        )?;
         Ok(())
     }
 
